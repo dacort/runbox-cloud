@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TypeVar, Union
 
 import boto3
+import yaml
 
 # Type hints
 T = TypeVar("T", bound="Resource")
@@ -40,86 +41,57 @@ class ResourceState(Enum):
     ERROR = "error"
 
 
-@dataclass
-class ResourceConfig:
-    """Base configuration for all resources."""
-
-    resource_id: Optional[str] = None
-    created_at: Optional[str] = None
-    state: ResourceState = ResourceState.PENDING
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            "resource_id": self.resource_id,
-            "created_at": self.created_at,
-            "state": self.state.value,
-            "metadata": self.metadata,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ResourceConfig":
-        """Create from dictionary."""
-        return cls(
-            resource_id=data.get("resource_id"),
-            created_at=data.get("created_at"),
-            state=ResourceState(data.get("state", ResourceState.PENDING.value)),
-            metadata=data.get("metadata", {}),
-        )
-
-
 class StateManager:
-    """Manages resource state persistence."""
+    """Manages resource state persistence using YAML."""
 
     _instance = None
 
-    def __new__(cls, state_file: str = "cloud_resources.json"):
+    def __new__(cls, state_file: str = "cloud_resources.yaml"):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, state_file: str = "cloud_resources.json"):
+    def __init__(self, state_file: str = "cloud_resources.yaml"):
         if hasattr(self, "_initialized"):
             return
-        # Include environment in the state file name
-        env = get_environment()
-        if env != "default":
-            state_file = f"cloud_resources_{env}.json"
+
         self.state_file = Path(state_file)
         self._state: Dict[str, Dict[str, Any]] = {}
         self._load_state()
         self._initialized = True
 
     def _load_state(self):
-        """Load state from file."""
+        """Load state from YAML file."""
         if self.state_file.exists():
             try:
                 with open(self.state_file, "r") as f:
-                    self._state = json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
+                    self._state = yaml.safe_load(f) or {}
+            except (yaml.YAMLError, FileNotFoundError):
                 self._state = {}
 
     def save_state(self):
-        """Save state to file."""
+        """Save state to YAML file."""
         with open(self.state_file, "w") as f:
-            json.dump(self._state, f, indent=2)
+            yaml.dump(self._state, f, default_flow_style=False, indent=2)
 
-    def get_resource_config(self, resource_key: str) -> Optional[ResourceConfig]:
-        """Get configuration for a resource."""
-        if resource_key in self._state:
-            return ResourceConfig.from_dict(self._state[resource_key])
-        return None
+    def get_resource_config(self, resource_key: str) -> Optional[Dict[str, Any]]:
+        """Get configuration for a resource in the current environment."""
+        env = get_environment()
+        return self._state.get(env, {}).get(resource_key)
 
-    def set_resource_config(self, resource_key: str, config: ResourceConfig):
-        """Set configuration for a resource."""
-        self._state[resource_key] = config.to_dict()
+    def set_resource_config(self, resource_key: str, config: Dict[str, Any]):
+        """Set configuration for a resource in the current environment."""
+        env = get_environment()
+        if env not in self._state:
+            self._state[env] = {}
+        self._state[env][resource_key] = config
         self.save_state()
 
     def remove_resource(self, resource_key: str):
-        """Remove a resource from state."""
-        if resource_key in self._state:
-            del self._state[resource_key]
+        """Remove a resource from state in the current environment."""
+        env = get_environment()
+        if env in self._state and resource_key in self._state[env]:
+            del self._state[env][resource_key]
             self.save_state()
 
 
@@ -156,7 +128,7 @@ class Resource(ABC):
         self.retain = retain if retain is not None else self.retain_by_default
         self.name = name  # Optional name for the resource instance, required if multiple instances of the same resource type are created
         self._dependents: List["Resource"] = []
-        self._config: Optional[ResourceConfig] = None
+        self._config: Dict[str, Any] = {}
         self._state_manager = StateManager()
 
         # Handle dependencies
@@ -180,13 +152,20 @@ class Resource(ABC):
     @property
     def resource_key(self) -> str:
         """Unique key for this resource in the state file."""
-        # TODO: Add in hashed name if provided
-        return f"{self.provider}:{self.resource_type}:{self.__class__.__name__}"
+        key = f"{self.provider}:{self.resource_type}:{self.__class__.__name__}"
+        if self.name:
+            key += f":{self.name}"
+        return key
 
     def _load_config(self):
         """Load configuration from state manager."""
         if self.retain:
-            self._config = self._state_manager.get_resource_config(self.resource_key)
+            config = self._state_manager.get_resource_config(self.resource_key)
+            if config:
+                self._config = config
+                print(
+                    f"Loaded existing config for {self.__class__.__name__}: {self._config.get('resource_id', 'unknown')}"
+                )
 
     def _save_config(self):
         """Save configuration to state manager."""
@@ -196,10 +175,10 @@ class Resource(ABC):
     def get_or_create(self) -> "Resource":
         """Get or create the resource instance."""
         # Check if we have existing config and resource exists
-        if self._config and self._config.resource_id:
+        if self._config and self._config.get("resource_id"):
             if self._exists():
                 print(
-                    f"Using existing {self.__class__.__name__}: {self._config.resource_id}"
+                    f"Using existing {self.__class__.__name__}: {self._config['resource_id']}"
                 )
                 return self
 
@@ -209,18 +188,20 @@ class Resource(ABC):
 
         # Create this resource
         print(f"Creating {self.__class__.__name__}...")
-        self._config = ResourceConfig(
-            state=ResourceState.CREATING, created_at=datetime.now().isoformat()
-        )
+        self._config = {
+            "state": ResourceState.CREATING.value,
+            "created_at": datetime.now().isoformat(),
+            "resource_id": None,
+        }
 
         try:
             resource_id = self._create()
-            self._config.resource_id = resource_id
-            self._config.state = ResourceState.ACTIVE
+            self._config["resource_id"] = resource_id
+            self._config["state"] = ResourceState.ACTIVE.value
             self._save_config()
             print(f"Created {self.__class__.__name__}: {resource_id}")
         except Exception as e:
-            self._config.state = ResourceState.ERROR
+            self._config["state"] = ResourceState.ERROR.value
             self._save_config()
             raise e
 
@@ -228,22 +209,22 @@ class Resource(ABC):
 
     def destroy(self):
         """Destroy the resource."""
-        if not self._config or not self._config.resource_id:
+        if not self._config or not self._config.get("resource_id"):
             return
 
-        print(f"Destroying {self.__class__.__name__}: {self._config.resource_id}")
-        self._config.state = ResourceState.DELETING
+        print(f"Destroying {self.__class__.__name__}: {self._config['resource_id']}")
+        self._config["state"] = ResourceState.DELETING.value
         self._save_config()
 
         try:
             self._destroy()
-            self._config.state = ResourceState.DELETED
+            self._config["state"] = ResourceState.DELETED.value
             if not self.retain:
                 self._state_manager.remove_resource(self.resource_key)
             else:
                 self._save_config()
         except Exception as e:
-            self._config.state = ResourceState.ERROR
+            self._config["state"] = ResourceState.ERROR.value
             self._save_config()
             raise e
 
@@ -261,30 +242,6 @@ class Resource(ABC):
     def _exists(self) -> bool:
         """Check if the resource exists."""
         pass
-
-
-# AWS-specific configurations
-@dataclass
-class VPCConfig(ResourceConfig):
-    vpc_id: Optional[str] = None
-    security_group_id: Optional[str] = None
-    subnet_ids: List[str] = field(default_factory=list)
-    internet_gateway_id: Optional[str] = None
-
-
-@dataclass
-class EC2Config(ResourceConfig):
-    instance_id: Optional[str] = None
-    instance_type: Optional[str] = None
-    ami_id: Optional[str] = None
-    public_ip: Optional[str] = None
-    private_ip: Optional[str] = None
-
-
-@dataclass
-class S3Config(ResourceConfig):
-    bucket_name: Optional[str] = None
-    region: Optional[str] = None
 
 
 # AWS Resources
@@ -306,14 +263,13 @@ class VPC(AWSResource):
         ec2 = boto3.client("ec2")
 
         # Create VPC
-        # TODO: Use name
         vpc_response = ec2.create_vpc(
             CidrBlock=self.cidr_block,
             TagSpecifications=[
                 {
                     "ResourceType": "vpc",
                     "Tags": [
-                        {"Key": "Name", "Value": "cloudrun-preview-vpc"},
+                        {"Key": "Name", "Value": self.name or "cloudrun-preview-vpc"},
                         {"Key": "cloudrun-version", "Value": "v0.0.1"},
                     ],
                 }
@@ -338,52 +294,50 @@ class VPC(AWSResource):
         )
         sg_id = sg_response["GroupId"]
 
-        # TODO: Create this further up
-        # Update config
-        if not isinstance(self._config, VPCConfig):
-            self._config = VPCConfig.from_dict(self._config.to_dict())
-
-        self._config.vpc_id = vpc_id
-        self._config.security_group_id = sg_id
-        self._config.subnet_ids = [subnet_id]
-        self._config.internet_gateway_id = igw_id
+        # Update config with all VPC details
+        self._config.update(
+            {
+                "vpc_id": vpc_id,
+                "security_group_id": sg_id,
+                "subnet_ids": [subnet_id],
+                "internet_gateway_id": igw_id,
+                "cidr_block": self.cidr_block,
+            }
+        )
 
         return vpc_id
 
     def _destroy(self):
-        if not isinstance(self._config, VPCConfig):
-            return
-
         ec2 = boto3.client("ec2")
 
         # Detach and delete internet gateway
-        if self._config.internet_gateway_id:
+        if self._config.get("internet_gateway_id"):
             ec2.detach_internet_gateway(
-                InternetGatewayId=self._config.internet_gateway_id,
-                VpcId=self._config.vpc_id,
+                InternetGatewayId=self._config["internet_gateway_id"],
+                VpcId=self._config["vpc_id"],
             )
             ec2.delete_internet_gateway(
-                InternetGatewayId=self._config.internet_gateway_id
+                InternetGatewayId=self._config["internet_gateway_id"]
             )
 
         # Delete subnets
-        for subnet_id in self._config.subnet_ids:
+        for subnet_id in self._config.get("subnet_ids", []):
             ec2.delete_subnet(SubnetId=subnet_id)
 
         # Delete security group
-        if self._config.security_group_id:
-            ec2.delete_security_group(GroupId=self._config.security_group_id)
+        if self._config.get("security_group_id"):
+            ec2.delete_security_group(GroupId=self._config["security_group_id"])
 
         # Delete VPC
-        ec2.delete_vpc(VpcId=self._config.vpc_id)
+        ec2.delete_vpc(VpcId=self._config["vpc_id"])
 
     def _exists(self) -> bool:
-        if not isinstance(self._config, VPCConfig) or not self._config.vpc_id:
+        if not self._config.get("vpc_id"):
             return False
 
         ec2 = boto3.client("ec2")
         try:
-            response = ec2.describe_vpcs(VpcIds=[self._config.vpc_id])
+            response = ec2.describe_vpcs(VpcIds=[self._config["vpc_id"]])
             return len(response["Vpcs"]) > 0
         except:
             return False
@@ -431,7 +385,7 @@ class EC2Instance(AWSResource):
 
         # Get VPC config
         vpc_config = self.vpc._config
-        if not isinstance(vpc_config, VPCConfig):
+        if not vpc_config.get("security_group_id"):
             raise ValueError("VPC configuration is not available")
 
         response = ec2.run_instances(
@@ -439,38 +393,39 @@ class EC2Instance(AWSResource):
             ImageId=self.ami_id,
             MinCount=1,
             MaxCount=1,
-            SecurityGroupIds=[vpc_config.security_group_id]
-            if vpc_config.security_group_id
-            else [],
-            SubnetId=vpc_config.subnet_ids[0] if vpc_config.subnet_ids else None,
+            SecurityGroupIds=[vpc_config["security_group_id"]],
+            SubnetId=vpc_config["subnet_ids"][0]
+            if vpc_config.get("subnet_ids")
+            else None,
         )
 
         instance_id = response["Instances"][0]["InstanceId"]
 
         # Update config
-        if not isinstance(self._config, EC2Config):
-            self._config = EC2Config.from_dict(self._config.to_dict())
-
-        self._config.instance_id = instance_id
-        self._config.instance_type = self.instance_type.type_name
-        self._config.ami_id = self.ami_id
+        self._config.update(
+            {
+                "instance_id": instance_id,
+                "instance_type": self.instance_type.type_name,
+                "ami_id": self.ami_id,
+            }
+        )
 
         return instance_id
 
     def _destroy(self):
-        if not isinstance(self._config, EC2Config) or not self._config.instance_id:
+        if not self._config.get("instance_id"):
             return
 
         ec2 = boto3.client("ec2")
-        ec2.terminate_instances(InstanceIds=[self._config.instance_id])
+        ec2.terminate_instances(InstanceIds=[self._config["instance_id"]])
 
     def _exists(self) -> bool:
-        if not isinstance(self._config, EC2Config) or not self._config.instance_id:
+        if not self._config.get("instance_id"):
             return False
 
         ec2 = boto3.client("ec2")
         try:
-            response = ec2.describe_instances(InstanceIds=[self._config.instance_id])
+            response = ec2.describe_instances(InstanceIds=[self._config["instance_id"]])
             instances = []
             for reservation in response["Reservations"]:
                 instances.extend(reservation["Instances"])
@@ -512,41 +467,37 @@ class S3Bucket(AWSResource):
             s3.create_bucket(Bucket=self.bucket_name)
 
         # Update config
-        if not isinstance(self._config, S3Config):
-            self._config = S3Config.from_dict(self._config.to_dict())
-
-        self._config.bucket_name = self.bucket_name
-        self._config.region = self.region
+        self._config.update({"bucket_name": self.bucket_name, "region": self.region})
 
         return self.bucket_name
 
     def _destroy(self):
-        if not isinstance(self._config, S3Config) or not self._config.bucket_name:
+        if not self._config.get("bucket_name"):
             return
 
-        s3 = boto3.client("s3", region_name=self._config.region)
+        s3 = boto3.client("s3", region_name=self._config["region"])
 
         # Delete all objects first
         try:
-            response = s3.list_objects_v2(Bucket=self._config.bucket_name)
+            response = s3.list_objects_v2(Bucket=self._config["bucket_name"])
             if "Contents" in response:
                 objects = [{"Key": obj["Key"]} for obj in response["Contents"]]
                 s3.delete_objects(
-                    Bucket=self._config.bucket_name, Delete={"Objects": objects}
+                    Bucket=self._config["bucket_name"], Delete={"Objects": objects}
                 )
         except:
             pass
 
         # Delete bucket
-        s3.delete_bucket(Bucket=self._config.bucket_name)
+        s3.delete_bucket(Bucket=self._config["bucket_name"])
 
     def _exists(self) -> bool:
-        if not isinstance(self._config, S3Config) or not self._config.bucket_name:
+        if not self._config.get("bucket_name"):
             return False
 
-        s3 = boto3.client("s3", region_name=self._config.region)
+        s3 = boto3.client("s3", region_name=self._config["region"])
         try:
-            s3.head_bucket(Bucket=self._config.bucket_name)
+            s3.head_bucket(Bucket=self._config["bucket_name"])
             return True
         except:
             return False
@@ -584,19 +535,14 @@ def main(env, destroy):
         ec2.get_or_create()
         s3.get_or_create()
 
-        print(f"VPC ID: {vpc._config.resource_id}")
-        print(f"EC2 Instance ID: {ec2._config.resource_id}")
-        print(f"S3 Bucket: {s3._config.resource_id}")
+        print(f"VPC ID: {vpc._config.get('resource_id')}")
+        print(f"EC2 Instance ID: {ec2._config.get('resource_id')}")
+        print(f"S3 Bucket: {s3._config.get('resource_id')}")
 
 
 if __name__ == "__main__":
-    # main()
-
-    # Alternative programmatic usage:
-    # set_environment("production")
+    # Example usage:
+    set_environment("production")
     vpc = VPC(retain=True)
-    # ec2 = EC2Instance("t3.micro", vpc=vpc)
-    #
-    # # Deploy resources
     vpc.get_or_create()
-    # ec2.get_or_create()
+    print(f"VPC ID: {vpc._config.get('resource_id')}")
