@@ -5,12 +5,28 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union
+from typing import Any, Dict, List, Optional, TypeVar, Union
 
 import boto3
 
 # Type hints
 T = TypeVar("T", bound="Resource")
+
+# Global environment configuration
+_current_environment = "default"
+
+
+def set_environment(env: str):
+    """Set the current environment."""
+    global _current_environment
+    _current_environment = env
+    # Reset StateManager singleton to use new environment
+    StateManager._instance = None
+
+
+def get_environment() -> str:
+    """Get the current environment."""
+    return _current_environment
 
 
 class ResourceState(Enum):
@@ -56,10 +72,24 @@ class ResourceConfig:
 class StateManager:
     """Manages resource state persistence."""
 
+    _instance = None
+
+    def __new__(cls, state_file: str = "cloud_resources.json"):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self, state_file: str = "cloud_resources.json"):
+        if hasattr(self, "_initialized"):
+            return
+        # Include environment in the state file name
+        env = get_environment()
+        if env != "default":
+            state_file = f"cloud_resources_{env}.json"
         self.state_file = Path(state_file)
         self._state: Dict[str, Dict[str, Any]] = {}
         self._load_state()
+        self._initialized = True
 
     def _load_state(self):
         """Load state from file."""
@@ -120,8 +150,11 @@ class Resource(ABC):
     resource_type: str = "unknown"
     retain_by_default: bool = False
 
-    def __init__(self, retain: Optional[bool] = None, **kwargs):
+    def __init__(
+        self, retain: Optional[bool] = None, name: Optional[str] = None, **kwargs
+    ):
         self.retain = retain if retain is not None else self.retain_by_default
+        self.name = name  # Optional name for the resource instance, required if multiple instances of the same resource type are created
         self._dependents: List["Resource"] = []
         self._config: Optional[ResourceConfig] = None
         self._state_manager = StateManager()
@@ -147,6 +180,7 @@ class Resource(ABC):
     @property
     def resource_key(self) -> str:
         """Unique key for this resource in the state file."""
+        # TODO: Add in hashed name if provided
         return f"{self.provider}:{self.resource_type}:{self.__class__.__name__}"
 
     def _load_config(self):
@@ -272,6 +306,7 @@ class VPC(AWSResource):
         ec2 = boto3.client("ec2")
 
         # Create VPC
+        # TODO: Use name
         vpc_response = ec2.create_vpc(
             CidrBlock=self.cidr_block,
             TagSpecifications=[
@@ -303,6 +338,7 @@ class VPC(AWSResource):
         )
         sg_id = sg_response["GroupId"]
 
+        # TODO: Create this further up
         # Update config
         if not isinstance(self._config, VPCConfig):
             self._config = VPCConfig.from_dict(self._config.to_dict())
@@ -449,11 +485,15 @@ class S3Bucket(AWSResource):
     resource_type = "storage"
 
     def __init__(
-        self, bucket_name: Optional[str] = None, region: str = "us-east-1", **kwargs
+        self,
+        bucket_name: Optional[str] = None,
+        region: str = "us-east-1",
+        name: Optional[str] = None,
+        **kwargs,
     ):
         self.bucket_name = bucket_name
         self.region = region
-        super().__init__(**kwargs)
+        super().__init__(name=name, **kwargs)
 
     def _create(self) -> str:
         s3 = boto3.client("s3", region_name=self.region)
@@ -512,19 +552,51 @@ class S3Bucket(AWSResource):
             return False
 
 
-# Example usage
-if __name__ == "__main__":
+# Example usage and CLI integration
+import click
+
+
+@click.command()
+@click.option("--env", default="default", help="Environment to use (default: default)")
+@click.option(
+    "--destroy", is_flag=True, help="Destroy resources instead of creating them"
+)
+def main(env, destroy):
+    """Main CLI entry point."""
+    set_environment(env)
+    print(f"Using environment: {env}")
+
     # Create resources with dependencies
+    vpc = VPC(name="cloudrun-preview-vpc", retain=True)
+    ec2 = EC2Instance("t3.micro", vpc=vpc, name="web-server")
+    s3 = S3Bucket(bucket_name="my-test-bucket", name="data-bucket")
+
+    if destroy:
+        # Destroy resources in reverse order
+        print("Destroying resources...")
+        s3.destroy()
+        ec2.destroy()
+        vpc.destroy()
+    else:
+        # Deploy resources
+        print("Creating resources...")
+        vpc.get_or_create()
+        ec2.get_or_create()
+        s3.get_or_create()
+
+        print(f"VPC ID: {vpc._config.resource_id}")
+        print(f"EC2 Instance ID: {ec2._config.resource_id}")
+        print(f"S3 Bucket: {s3._config.resource_id}")
+
+
+if __name__ == "__main__":
+    # main()
+
+    # Alternative programmatic usage:
+    # set_environment("production")
     vpc = VPC(retain=True)
-    ec2 = EC2Instance("t3.micro", vpc=vpc)
-    s3 = S3Bucket(bucket_name="my-test-bucket")
-
-    # Deploy resources
+    # ec2 = EC2Instance("t3.micro", vpc=vpc)
+    #
+    # # Deploy resources
     vpc.get_or_create()
-    ec2.get_or_create()
-    s3.get_or_create()
-
-    # Later, you can destroy them
-    # s3.destroy()
-    # ec2.destroy()
-    # vpc.destroy()  # Only if not retained
+    # ec2.get_or_create()
