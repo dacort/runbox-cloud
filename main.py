@@ -2,7 +2,6 @@ import click
 
 from commands.auth import auth
 from providers import Provider
-from providers.aws import AWS
 
 
 @click.group()

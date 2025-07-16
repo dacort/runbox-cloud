@@ -9,6 +9,8 @@ import boto3
 import click
 import yaml
 
+from providers import Provider
+
 # Type hints
 T = TypeVar("T", bound="Resource")
 
@@ -241,6 +243,14 @@ class Resource(ABC):
     def _exists(self) -> bool:
         """Check if the resource exists."""
         pass
+
+
+class AWS(Provider):
+    def __init__(self):
+        pass
+
+    def run(self, executable, instance_type, options=None):
+        click.echo(f"Running {executable} on AWS with instance type {instance_type}")
 
 
 # AWS Resources
