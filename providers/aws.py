@@ -1,4 +1,9 @@
+import json
 import re
+import uuid
+import time
+from botocore.exceptions import ClientError
+import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import Enum
@@ -10,6 +15,8 @@ import click
 import yaml
 
 from providers import Provider
+
+logger = logging.getLogger(__name__)
 
 # Type hints
 T = TypeVar("T", bound="Resource")
@@ -363,22 +370,165 @@ class AWSEC2InstanceType:
         return self.type_name
 
 
-@depends_on(VPC)
+class EC2IAMrole(AWSResource):
+    """A simple class to represent an AWS IAM role for EC2 instances.
+
+    This role specifically adds the `AmazonSSMManagedInstanceCore` policy to allow
+    for easy remote connectivity.
+
+    Additional permissions can be added via the command-line.
+    """
+    resource_type = "iam"
+    retain_by_default = True
+    role_name: str
+
+    def __init__(self, role_name: Optional[str] = None, **kwargs):
+        if role_name:
+            self.role_name = role_name
+        else:
+            # TODO: I _don't_ think this is gonna work, but we'll try it!
+            self.role_name = f"cloudrun-ec2-role-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+        super().__init__(**kwargs)
+
+    def _create(self) -> str:
+        iam = boto3.client("iam")
+
+        # Create IAM role
+        response = iam.create_role(
+            RoleName=self.role_name,
+            Path="/cloudrun/",
+            Description="CloudRun EC2 role",
+            AssumeRolePolicyDocument=json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"Service": "ec2.amazonaws.com"},
+                            "Action": "sts:AssumeRole",
+                        }
+                    ],
+                }
+            ),
+            Tags=[
+                {"Key": "cloudrun-version", "Value": "v0.0.1"},
+            ],
+        )
+        role_arn = response["Role"]["Arn"]
+        self._config["role_arn"] = role_arn
+        self._config['role_name'] = self.role_name
+
+        return role_arn
+
+    def _exists(self) -> bool:
+        if not self._config.get("role_name"):
+            return False
+        role_name = self._config.get("role_name")
+
+        iam = boto3.client("iam")
+        try:
+            response = iam.get_role(RoleName=role_name)
+            return "Role" in response and response["Role"]["RoleName"] == role_name
+        except iam.exceptions.NoSuchEntityException:
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking IAM role: {e}")
+            return False
+    
+    def _destroy(self):
+        if not self._config.get("role_name"):
+            return False
+        role_name = self._config.get("role_name")
+
+        iam = boto3.client("iam")
+        iam.delete_role(RoleName=role_name)
+
+@depends_on(EC2IAMrole)
+class EC2InstanceProfile(AWSResource):
+    """A simple class to represent an AWS EC2 instance profile for the IAM role."""
+    resource_type = "iam"
+    retain_by_default = True
+    ec2iamrole: Optional[EC2IAMrole]
+
+    def __init__(self, ec2iamrole: Optional[EC2IAMrole] = None, **kwargs):
+        self.ec2iamrole = ec2iamrole
+        super().__init__(ec2iamrole=ec2iamrole, **kwargs)
+
+    def _create(self) -> str:
+        # TODO: See if there's a better way to do this - this _should_ always be present
+        if not self.ec2iamrole:
+           raise ValueError("EC2IAMrole is required but not provided")
+     
+        iam = boto3.client("iam")
+
+        # Create instance profile
+        response = iam.create_instance_profile(
+            InstanceProfileName=self.ec2iamrole.role_name,
+            Path="/cloudrun/",
+            Tags=[{"Key": "cloudrun-version", "Value": "v0.0.1"}],
+        )
+        iam.add_role_to_instance_profile(
+            InstanceProfileName=self.ec2iamrole.role_name, RoleName=self.ec2iamrole.role_name
+        )
+
+        instance_profile_arn = response["InstanceProfile"]["Arn"]
+        self._config["instance_profile_arn"] = instance_profile_arn
+
+        return instance_profile_arn
+
+    def _exists(self) -> bool:
+        if not self._config.get("instance_profile_arn"):
+            return False
+
+        iam = boto3.client("iam")
+        role_config = self.ec2iamrole._config
+        role_name = role_config.get("role_name")
+
+        try:
+            response = iam.get_instance_profile(InstanceProfileName=role_name)
+            return "InstanceProfile" in response and response["InstanceProfile"]["InstanceProfileName"] == role_name
+        except iam.exceptions.NoSuchEntityException:
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking instance profile: {e}")
+            return False
+    
+    def _destroy(self):
+        if not self._config.get("instance_profile_arn"):
+            return
+
+        if not self.ec2iamrole:
+            raise ValueError("EC2IAMrole is required but not provided")
+        
+        role_config = self.ec2iamrole._config
+        role_name = role_config.get("role_name")
+
+        iam = boto3.client("iam")
+        iam.remove_role_from_instance_profile(
+            InstanceProfileName=role_name, RoleName=role_name
+        )
+        iam.delete_instance_profile(InstanceProfileName=role_name)
+
+@depends_on(VPC, EC2InstanceProfile)
 class EC2Instance(AWSResource):
     resource_type = "compute"
+    vpc: VPC
+    ec2instanceprofile: Optional[EC2InstanceProfile]
 
     def __init__(
         self,
         instance_type: Union[AWSEC2InstanceType, str],
         ami_id: Optional[str] = None,
         vpc: Optional[VPC] = None,
+        ec2instanceprofile: Optional[EC2InstanceProfile] = None,
         **kwargs,
     ):
         if isinstance(instance_type, str):
             instance_type = AWSEC2InstanceType(instance_type)
         self.instance_type = instance_type
         self.ami_id = ami_id or self._get_default_ami()
-        super().__init__(vpc=vpc, **kwargs)
+        super().__init__(vpc=vpc, ec2instanceprofile=ec2instanceprofile, **kwargs)
 
     def _get_default_ami(self) -> str:
         """Get default AMI for the instance type."""
@@ -397,16 +547,37 @@ class EC2Instance(AWSResource):
         if not vpc_config.get("security_group_id"):
             raise ValueError("VPC configuration is not available")
 
-        response = ec2.run_instances(
-            InstanceType=self.instance_type.type_name,
-            ImageId=self.ami_id,
-            MinCount=1,
-            MaxCount=1,
-            SecurityGroupIds=[vpc_config["security_group_id"]],
-            SubnetId=vpc_config["subnet_ids"][0]
-            if vpc_config.get("subnet_ids")
-            else None,
-        )
+        # Retry logic for instance profile propagation
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = ec2.run_instances(
+                    InstanceType=self.instance_type.type_name,
+                    ImageId=self.ami_id,
+                    MinCount=1,
+                    MaxCount=1,
+                    SecurityGroupIds=[vpc_config["security_group_id"]],
+                    SubnetId=vpc_config["subnet_ids"][0]
+                    if vpc_config.get("subnet_ids")
+                    else None,
+                    IamInstanceProfile={
+                        "Arn": self.ec2instanceprofile._config["instance_profile_arn"]
+                    } if self.ec2instanceprofile else None,
+                )
+                break  # Success, exit retry loop
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code')
+                error_message = e.response.get('Error', {}).get('Message', '')
+                # Check if this is the IAM instance profile propagation error
+                if (error_code == 'InvalidParameterValue' and 
+                    'Invalid IAM Instance Profile ARN' in error_message):
+                    if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                        time.sleep(2)
+                        continue
+                
+                # Re-raise the exception if it's not our target error or we've exhausted retries
+                logger.error(f"Error creating EC2 instance: {error_message}")
+                raise
 
         instance_id = response["Instances"][0]["InstanceId"]
 

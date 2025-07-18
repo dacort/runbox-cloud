@@ -1,5 +1,15 @@
 # Cloud Run
 
+## TODOS
+
+- Allow user to specify a pre-existing VPC or IAM Role
+- Better logging
+- Partial deletion / just remove resources from config when deleted
+- Better AWS session client
+- Better depends attrs names than just _lower_
+- Cascading deletes and dependencies
+    - e.g. role can't be deleted without the instance profile being detached
+
 It all starts [with a skeet](https://bsky.app/profile/alexmillerdb.bsky.social/post/3lnvz2fxac22p).
 
 ![I want to be able to just `run-on-cloud --instance i3en.2xlarge ./my_benchmark`](image.png)
