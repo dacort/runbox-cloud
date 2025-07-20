@@ -9,6 +9,10 @@
 - Better depends attrs names than just _lower_
 - Cascading deletes and dependencies
     - e.g. role can't be deleted without the instance profile being detached
+- IPv6
+- S3/SSM Endpoint
+- Decide whether to delete my ID in VPC, or list and delete
+- Add option to add a NAT Gateway if they want to burn money
 
 It all starts [with a skeet](https://bsky.app/profile/alexmillerdb.bsky.social/post/3lnvz2fxac22p).
 

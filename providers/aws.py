@@ -1,18 +1,20 @@
+import base64
 import json
-import re
-import uuid
-import time
-from botocore.exceptions import ClientError
 import logging
+import re
+import time
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import Enum
+from math import log
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypeVar, Union
 
 import boto3
 import click
 import yaml
+from botocore.exceptions import ClientError
 
 from providers import Provider
 
@@ -167,9 +169,10 @@ class Resource(ABC):
 
     def _load_config(self):
         """Load configuration from state manager."""
+        # TODO: This probably isn't the right approach, but it works for now
         if self.retain:
             config = self._state_manager.get_resource_config(self.resource_key)
-            if config:
+            if config and config.get("state") != ResourceState.DELETED.value:
                 self._config = config
                 print(
                     f"Loaded existing config for {self.__class__.__name__}: {self._config.get('resource_id', 'unknown')}"
@@ -268,6 +271,14 @@ class AWSResource(Resource):
 
 
 class VPC(AWSResource):
+    """Create a public VPC with an S3 gateway, internet gateway, and default security group.
+
+    The subnet does not have public IPs by default, but can be assigned per instance.
+    The default security group allows all outbound traffic, but no inbound traffic.
+
+    No NAT gateway is used to keep costs low.
+    """
+
     resource_type = "network"
     retain_by_default = True
 
@@ -293,6 +304,13 @@ class VPC(AWSResource):
         )
         vpc_id = vpc_response["Vpc"]["VpcId"]
 
+        # Enable DNS support
+        ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+
+        # TODO: Quick validation to make sure the VPC was created
+        # TODO: Create an S3 endpoint - they're free, so why not?
+        # But right now the EC2 instance profile doesn't have any access to S3.
+
         # Create internet gateway
         igw_response = ec2.create_internet_gateway()
         igw_id = igw_response["InternetGateway"]["InternetGatewayId"]
@@ -301,6 +319,16 @@ class VPC(AWSResource):
         # Create subnet
         subnet_response = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.120.1.0/24")
         subnet_id = subnet_response["Subnet"]["SubnetId"]
+
+        # Create route tables to allow internet access
+        route_table_response = ec2.create_route_table(VpcId=vpc_id)
+        route_table_id = route_table_response["RouteTable"]["RouteTableId"]
+        ec2.create_route(
+            RouteTableId=route_table_id,
+            DestinationCidrBlock="0.0.0.0/0",
+            GatewayId=igw_id,
+        )
+        ec2.associate_route_table(RouteTableId=route_table_id, SubnetId=subnet_id)
 
         # Create security group
         sg_response = ec2.create_security_group(
@@ -335,14 +363,30 @@ class VPC(AWSResource):
             ec2.delete_internet_gateway(
                 InternetGatewayId=self._config["internet_gateway_id"]
             )
+            self._config.pop("internet_gateway_id")
 
         # Delete subnets
         for subnet_id in self._config.get("subnet_ids", []):
             ec2.delete_subnet(SubnetId=subnet_id)
+            self._config["subnet_ids"].remove(subnet_id)
 
         # Delete security group
         if self._config.get("security_group_id"):
             ec2.delete_security_group(GroupId=self._config["security_group_id"])
+            self._config.pop("security_group_id")
+
+        # Delete route tables
+        route_tables = ec2.describe_route_tables(
+            Filters=[
+                {"Name": "vpc-id", "Values": [self._config["vpc_id"]]},
+                # {"Name": "association.main", "Values": ["true"]},
+            ]
+        )
+        for rt in route_tables.get("RouteTables", []):
+            if any([a.get("Main") for a in rt.get("Associations", [])]):
+                continue
+            logger.info(f"Deleting route table {rt['RouteTableId']}")
+            ec2.delete_route_table(RouteTableId=rt["RouteTableId"])
 
         # Delete VPC
         ec2.delete_vpc(VpcId=self._config["vpc_id"])
@@ -369,6 +413,16 @@ class AWSEC2InstanceType:
     def __str__(self):
         return self.type_name
 
+    def al2023_ssm(self) -> str:
+        # User data script to install SSM agent
+        user_data_script = """#!/bin/bash
+        dnf install -y amazon-ssm-agent
+        systemctl enable amazon-ssm-agent
+        systemctl start amazon-ssm-agent
+        """
+
+        return user_data_script
+
 
 class EC2IAMrole(AWSResource):
     """A simple class to represent an AWS IAM role for EC2 instances.
@@ -378,6 +432,7 @@ class EC2IAMrole(AWSResource):
 
     Additional permissions can be added via the command-line.
     """
+
     resource_type = "iam"
     retain_by_default = True
     role_name: str
@@ -387,7 +442,9 @@ class EC2IAMrole(AWSResource):
             self.role_name = role_name
         else:
             # TODO: I _don't_ think this is gonna work, but we'll try it!
-            self.role_name = f"cloudrun-ec2-role-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            self.role_name = (
+                f"cloudrun-ec2-role-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            )
 
         super().__init__(**kwargs)
 
@@ -417,7 +474,13 @@ class EC2IAMrole(AWSResource):
         )
         role_arn = response["Role"]["Arn"]
         self._config["role_arn"] = role_arn
-        self._config['role_name'] = self.role_name
+        self._config["role_name"] = self.role_name
+
+        # Attach policy to allow SSM access
+        iam.attach_role_policy(
+            RoleName=self.role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        )
 
         return role_arn
 
@@ -435,18 +498,27 @@ class EC2IAMrole(AWSResource):
         except Exception as e:
             logger.error(f"Unexpected error checking IAM role: {e}")
             return False
-    
+
     def _destroy(self):
         if not self._config.get("role_name"):
             return False
         role_name = self._config.get("role_name")
 
         iam = boto3.client("iam")
+
+        # Detach policy
+        iam.detach_role_policy(
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        )
+
         iam.delete_role(RoleName=role_name)
+
 
 @depends_on(EC2IAMrole)
 class EC2InstanceProfile(AWSResource):
     """A simple class to represent an AWS EC2 instance profile for the IAM role."""
+
     resource_type = "iam"
     retain_by_default = True
     ec2iamrole: Optional[EC2IAMrole]
@@ -458,8 +530,8 @@ class EC2InstanceProfile(AWSResource):
     def _create(self) -> str:
         # TODO: See if there's a better way to do this - this _should_ always be present
         if not self.ec2iamrole:
-           raise ValueError("EC2IAMrole is required but not provided")
-     
+            raise ValueError("EC2IAMrole is required but not provided")
+
         iam = boto3.client("iam")
 
         # Create instance profile
@@ -469,7 +541,8 @@ class EC2InstanceProfile(AWSResource):
             Tags=[{"Key": "cloudrun-version", "Value": "v0.0.1"}],
         )
         iam.add_role_to_instance_profile(
-            InstanceProfileName=self.ec2iamrole.role_name, RoleName=self.ec2iamrole.role_name
+            InstanceProfileName=self.ec2iamrole.role_name,
+            RoleName=self.ec2iamrole.role_name,
         )
 
         instance_profile_arn = response["InstanceProfile"]["Arn"]
@@ -487,20 +560,23 @@ class EC2InstanceProfile(AWSResource):
 
         try:
             response = iam.get_instance_profile(InstanceProfileName=role_name)
-            return "InstanceProfile" in response and response["InstanceProfile"]["InstanceProfileName"] == role_name
+            return (
+                "InstanceProfile" in response
+                and response["InstanceProfile"]["InstanceProfileName"] == role_name
+            )
         except iam.exceptions.NoSuchEntityException:
             return False
         except Exception as e:
             logger.error(f"Unexpected error checking instance profile: {e}")
             return False
-    
+
     def _destroy(self):
         if not self._config.get("instance_profile_arn"):
             return
 
         if not self.ec2iamrole:
             raise ValueError("EC2IAMrole is required but not provided")
-        
+
         role_config = self.ec2iamrole._config
         role_name = role_config.get("role_name")
 
@@ -510,11 +586,13 @@ class EC2InstanceProfile(AWSResource):
         )
         iam.delete_instance_profile(InstanceProfileName=role_name)
 
+
 @depends_on(VPC, EC2InstanceProfile)
 class EC2Instance(AWSResource):
     resource_type = "compute"
     vpc: VPC
     ec2instanceprofile: Optional[EC2InstanceProfile]
+    use_public_ip: bool = True
 
     def __init__(
         self,
@@ -532,6 +610,7 @@ class EC2Instance(AWSResource):
 
     def _get_default_ami(self) -> str:
         """Get default AMI for the instance type."""
+        # TODO: Move this into the instance type class
         # This is a simplified example and only supports al2023 on x86 or arm64
         ssm_parameter = "al2023-ami-minimal-kernel-default-x86_64"
         if re.search(r"\dg\w+\.", self.instance_type.type_name):
@@ -547,34 +626,51 @@ class EC2Instance(AWSResource):
         if not vpc_config.get("security_group_id"):
             raise ValueError("VPC configuration is not available")
 
+        # Build up the instance config
+        run_instance_kwargs = {
+            "InstanceType": self.instance_type.type_name,
+            "ImageId": self.ami_id,
+            "MinCount": 1,
+            "MaxCount": 1,
+            "IamInstanceProfile": {
+                "Arn": self.ec2instanceprofile._config["instance_profile_arn"]
+            }
+            if self.ec2instanceprofile
+            else None,
+            "UserData": self.instance_type.al2023_ssm(),
+        }
+
+        if self.use_public_ip:
+            run_instance_kwargs["NetworkInterfaces"] = [
+                {
+                    "AssociatePublicIpAddress": True,
+                    "DeviceIndex": 0,
+                    "SubnetId": vpc_config["subnet_ids"][0],
+                    "Groups": [vpc_config["security_group_id"]],
+                }
+            ]
+        else:
+            run_instance_kwargs["SecurityGroupIds"] = [vpc_config["security_group_id"]]
+            run_instance_kwargs["SubnetId"] = vpc_config["subnet_ids"][0]
+
         # Retry logic for instance profile propagation
         max_retries = 5
         for attempt in range(max_retries):
             try:
-                response = ec2.run_instances(
-                    InstanceType=self.instance_type.type_name,
-                    ImageId=self.ami_id,
-                    MinCount=1,
-                    MaxCount=1,
-                    SecurityGroupIds=[vpc_config["security_group_id"]],
-                    SubnetId=vpc_config["subnet_ids"][0]
-                    if vpc_config.get("subnet_ids")
-                    else None,
-                    IamInstanceProfile={
-                        "Arn": self.ec2instanceprofile._config["instance_profile_arn"]
-                    } if self.ec2instanceprofile else None,
-                )
+                response = ec2.run_instances(**run_instance_kwargs)
                 break  # Success, exit retry loop
             except ClientError as e:
-                error_code = e.response.get('Error', {}).get('Code')
-                error_message = e.response.get('Error', {}).get('Message', '')
+                error_code = e.response.get("Error", {}).get("Code")
+                error_message = e.response.get("Error", {}).get("Message", "")
                 # Check if this is the IAM instance profile propagation error
-                if (error_code == 'InvalidParameterValue' and 
-                    'Invalid IAM Instance Profile ARN' in error_message):
+                if (
+                    error_code == "InvalidParameterValue"
+                    and "Invalid IAM Instance Profile ARN" in error_message
+                ):
                     if attempt < max_retries - 1:  # Don't sleep on the last attempt
                         time.sleep(2)
                         continue
-                
+
                 # Re-raise the exception if it's not our target error or we've exhausted retries
                 logger.error(f"Error creating EC2 instance: {error_message}")
                 raise
