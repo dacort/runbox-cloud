@@ -707,17 +707,155 @@ class EC2Instance(AWSResource):
         except:
             return False
 
-    def run(self, command: str, timeout_seconds: int = 300) -> int:
-        """Run a shell command on the instance via SSM using the local plugin.
-
-        Streams output to stdout and returns when the session ends.
-        Returns the exit code reported by the session (best-effort; 0 on success
-        if not determinable).
+    def run_command(self, command: str, timeout_seconds: int = 300) -> dict:
+        """Run a shell command on the instance via AWS-RunShellScript.
+        
+        Returns a dictionary with:
+        - status: 'Success', 'Failed', 'Cancelled', 'TimedOut'
+        - stdout: command output (up to 24KB)
+        - stderr: command errors (up to 8KB)  
+        - exit_code: command exit code
         """
+        if not self._config.get("instance_id"):
+            raise ValueError("Instance is not created; call get_or_create() first")
+
+        instance_id = self._config["instance_id"]
+        
+        # Ensure the instance is registered with SSM before running command
+        self._wait_for_ssm_agent(instance_id, timeout_seconds)
+        
+        ssm = boto3.client("ssm")
+        
+        # Execute via SSM RunShellScript document
+        response = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [command]},
+            TimeoutSeconds=timeout_seconds,
+        )
+        
+        command_id = response["Command"]["CommandId"]
+        
+        # Wait for completion and get output
+        return self._wait_for_command_completion(instance_id, command_id)
+
+    def _wait_for_command_completion(self, instance_id: str, command_id: str) -> dict:
+        """Wait for SSM command to complete and return results."""
+        import time
+        ssm = boto3.client("ssm")
+        
+        while True:
+            try:
+                response = ssm.get_command_invocation(
+                    CommandId=command_id, InstanceId=instance_id
+                )
+                
+                status = response["Status"]
+                
+                if status in ["Success", "Failed", "Cancelled", "TimedOut"]:
+                    return {
+                        "status": status,
+                        "stdout": response.get("StandardOutputContent", ""),
+                        "stderr": response.get("StandardErrorContent", ""),
+                        "exit_code": response.get("ResponseCode", -1),
+                    }
+                
+                time.sleep(2)
+                
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "InvocationDoesNotExist":
+                    time.sleep(2)
+                    continue
+                raise
+
+    def _should_use_interactive_mode(self, command: str) -> bool:
+        """Determine if command should use interactive mode based on characteristics."""
+        command_lower = command.lower().strip()
+        
+        # Shell invocations - these should always be interactive
+        shell_commands = [
+            'shell',      # Generic shell request
+            'bash',       # Bash shell
+            '/bin/bash',  # Full path bash
+            'zsh',        # Zsh shell
+            '/bin/zsh',   # Full path zsh
+            'sh',         # Generic shell
+            '/bin/sh',    # Full path sh
+            'fish',       # Fish shell
+            '/usr/bin/fish', # Full path fish
+        ]
+        
+        # Check if the command is exactly a shell command or starts with one
+        for shell in shell_commands:
+            if command_lower == shell or command_lower.startswith(shell + ' '):
+                return True
+        
+        # Also check for some other interactive commands that benefit from real-time I/O
+        interactive_patterns = [
+            'tail -f',    # Log following
+            'watch',      # Periodic updates  
+            'top',        # Interactive monitoring
+            'htop',       # Interactive monitoring
+        ]
+        
+        for pattern in interactive_patterns:
+            if pattern in command_lower:
+                return True
+            
+        return False
+
+    def run(self, command: str, timeout_seconds: int = 300, mode: str = "auto") -> int:
+        """Run a shell command on the instance with intelligent mode selection.
+
+        Args:
+            command: Shell command to execute
+            timeout_seconds: Maximum execution time
+            mode: Execution mode - 'auto', 'interactive', 'batch'
+                - 'auto': Choose based on command characteristics  
+                - 'interactive': Use session manager plugin for real-time I/O
+                - 'batch': Use AWS-RunShellScript for simple execution
+
+        Returns:
+            Exit code of the command
+        """
+        # Determine execution mode
+        if mode == "auto":
+            use_interactive = self._should_use_interactive_mode(command)
+        elif mode == "interactive":
+            use_interactive = True
+        elif mode == "batch":
+            use_interactive = False
+        else:
+            raise ValueError(f"Invalid mode '{mode}'. Use 'auto', 'interactive', or 'batch'")
+        
+        if use_interactive:
+            # Handle special case of generic "shell" command
+            if command.lower().strip() == "shell":
+                command = "bash"  # Default to bash for generic shell request
+                print("Starting interactive shell session...")
+            else:
+                print(f"Running command interactively: {command}")
+            return self._run_interactive(command, timeout_seconds)
+        else:
+            print(f"Running command in batch mode: {command}")
+            result = self.run_command(command, timeout_seconds)
+            
+            # Print output for batch mode
+            if result["stdout"]:
+                print(result["stdout"], end="")
+            if result["stderr"]:
+                import sys
+                print(result["stderr"], file=sys.stderr, end="")
+            
+            # Return exit code (convert to int if needed)
+            exit_code = result["exit_code"]
+            return int(exit_code) if exit_code != -1 else 1
+
+    def _run_interactive(self, command: str, timeout_seconds: int = 300) -> int:
+        """Run a shell command using the session manager plugin for real-time I/O."""
         import asyncio
         import os
         import sys
-        from threading import Event
 
         if not self._config.get("instance_id"):
             raise ValueError("Instance is not created; call get_or_create() first")
@@ -771,8 +909,10 @@ class EC2Instance(AWSResource):
 
         handler = SessionHandler()
 
-        # Execute and keep the event loop alive until the channel closes
+        # Enhanced command execution with better exit code detection
         async def _run_and_wait() -> int:
+            exit_code = 0
+            
             # Create session (without starting)
             session = await handler.validate_input_and_create_session(
                 {
@@ -788,9 +928,14 @@ class EC2Instance(AWSResource):
             ws_config = create_websocket_config(args.stream_url, args.token_value)
             data_channel = SessionDataChannel(ws_config)
 
-            # Stream remote output to stdout
+            # Capture output to detect exit code
+            output_buffer = []
+            
             def on_remote_input(data: bytes) -> None:
                 try:
+                    # Buffer output for exit code detection
+                    output_buffer.append(data)
+                    # Stream to stdout
                     sys.stdout.buffer.write(data)
                     sys.stdout.buffer.flush()
                 except Exception:
@@ -813,21 +958,47 @@ class EC2Instance(AWSResource):
             await session.execute()
             await asyncio.sleep(0.25)
 
-            # Send command then exit
-            await data_channel.send_input_data((command + "\n").encode("utf-8"))
-            await asyncio.sleep(0.05)
-            await data_channel.send_input_data(b"exit\n")
+            # Check if this is a shell session vs a command
+            is_shell_session = command.strip().lower() in ['bash', 'zsh', 'sh', 'fish', '/bin/bash', '/bin/zsh', '/bin/sh', '/usr/bin/fish']
+            
+            if is_shell_session:
+                # For shell sessions, just start the shell and let user interact
+                await data_channel.send_input_data((command + "\n").encode("utf-8"))
+                await asyncio.sleep(0.1)
+                print("Interactive shell started. Type 'exit' to close the session.")
+                
+                # Wait for user to exit the shell naturally
+                await closed_async.wait()
+            else:
+                # For regular commands, execute with exit code capture and auto-exit
+                command_with_exit_capture = f"{command}; echo \"EXIT_CODE:$?\" >&2"
+                await data_channel.send_input_data((command_with_exit_capture + "\n").encode("utf-8"))
+                await asyncio.sleep(0.05)
+                await data_channel.send_input_data(b"exit\n")
 
             # Wait for session close or timeout
             try:
                 await asyncio.wait_for(closed_async.wait(), timeout=timeout_seconds)
+                
+                # Try to extract exit code from output
+                full_output = b''.join(output_buffer).decode('utf-8', errors='ignore')
+                if "EXIT_CODE:" in full_output:
+                    try:
+                        # Find the exit code in stderr output
+                        exit_code_line = [line for line in full_output.split('\n') if 'EXIT_CODE:' in line][-1]
+                        exit_code = int(exit_code_line.split('EXIT_CODE:')[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+                        
             except asyncio.TimeoutError:
                 try:
                     if data_channel.is_open:
                         await data_channel.close()
                 except Exception:
                     pass
-            return 0
+                exit_code = 124  # Timeout exit code
+                
+            return exit_code
 
         return asyncio.run(_run_and_wait())
 
@@ -898,7 +1069,7 @@ class S3Bucket(AWSResource):
                 s3.delete_objects(
                     Bucket=self._config["bucket_name"], Delete={"Objects": objects}
                 )
-        except:
+        except ClientError:
             pass
 
         # Delete bucket
@@ -912,7 +1083,7 @@ class S3Bucket(AWSResource):
         try:
             s3.head_bucket(Bucket=self._config["bucket_name"])
             return True
-        except:
+        except ClientError:
             return False
 
 
