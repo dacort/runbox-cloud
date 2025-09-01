@@ -962,8 +962,10 @@ class EC2Instance(AWSResource):
             is_shell_session = command.strip().lower() in ['bash', 'zsh', 'sh', 'fish', '/bin/bash', '/bin/zsh', '/bin/sh', '/usr/bin/fish']
             
             if is_shell_session:
-                # For shell sessions, start shell and forward local stdin -> remote
-                await data_channel.send_input_data((command + "\n").encode("utf-8"))
+                # For shell sessions, replace the parent shell with the requested one
+                # so a single 'exit' terminates the session. Do not emit exit codes.
+                shell_wrapper = f"exec {command}"
+                await data_channel.send_input_data((shell_wrapper + "\n").encode("utf-8"))
                 await asyncio.sleep(0.1)
                 print("Interactive shell started. Type 'exit' to close the session.")
 
@@ -1013,6 +1015,8 @@ class EC2Instance(AWSResource):
                             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, restore_attrs)
                     except Exception:
                         pass
+                # Interactive shell: return immediately; no exit code parsing
+                return 0
             else:
                 # For regular commands, execute with exit code capture and auto-exit
                 command_with_exit_capture = f"{command}; echo \"EXIT_CODE:$?\" >&2"
