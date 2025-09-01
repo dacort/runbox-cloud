@@ -9,4 +9,10 @@ dependencies = [
     "boto3-stubs>=1.39.4",
     "click>=8.1.8",
     "pyyaml>=6.0.2",
+    "python-session-manager-plugin>=0.1.0",
 ]
+
+[tool.uv.sources]
+# Use a local editable path during development; uv will resolve this path.
+# If publishing or installing elsewhere, this can be removed or replaced with a versioned index source.
+python-session-manager-plugin = { path = "../python-session-manager-plugin" }
