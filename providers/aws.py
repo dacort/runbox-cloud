@@ -962,13 +962,57 @@ class EC2Instance(AWSResource):
             is_shell_session = command.strip().lower() in ['bash', 'zsh', 'sh', 'fish', '/bin/bash', '/bin/zsh', '/bin/sh', '/usr/bin/fish']
             
             if is_shell_session:
-                # For shell sessions, just start the shell and let user interact
+                # For shell sessions, start shell and forward local stdin -> remote
                 await data_channel.send_input_data((command + "\n").encode("utf-8"))
                 await asyncio.sleep(0.1)
                 print("Interactive shell started. Type 'exit' to close the session.")
-                
-                # Wait for user to exit the shell naturally
-                await closed_async.wait()
+
+                # Put terminal into cbreak/no-echo and forward keystrokes
+                restore_attrs = None
+                stdin_fd = None
+                try:
+                    import termios
+                    import tty
+                    if sys.stdin.isatty():
+                        stdin_fd = sys.stdin.fileno()
+                        restore_attrs = termios.tcgetattr(stdin_fd)
+                        tty.setcbreak(stdin_fd)  # no-echo, immediate key delivery
+                except Exception:
+                    restore_attrs = None
+                    stdin_fd = None
+
+                async def _stdin_pump() -> None:
+                    try:
+                        loop_inner = asyncio.get_running_loop()
+                        while not closed_async.is_set():
+                            # Read 1 byte at a time to preserve interactive feel
+                            data = await loop_inner.run_in_executor(None, sys.stdin.buffer.read, 1)
+                            if not data:
+                                await asyncio.sleep(0.01)
+                                continue
+                            try:
+                                await data_channel.send_input_data(data)
+                            except Exception:
+                                break
+                    except Exception:
+                        pass
+
+                pump_task = asyncio.create_task(_stdin_pump())
+
+                try:
+                    await closed_async.wait()
+                finally:
+                    # Stop pump and restore terminal
+                    try:
+                        pump_task.cancel()
+                    except Exception:
+                        pass
+                    try:
+                        if restore_attrs is not None and stdin_fd is not None:
+                            import termios
+                            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, restore_attrs)
+                    except Exception:
+                        pass
             else:
                 # For regular commands, execute with exit code capture and auto-exit
                 command_with_exit_capture = f"{command}; echo \"EXIT_CODE:$?\" >&2"
