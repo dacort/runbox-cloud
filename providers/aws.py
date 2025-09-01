@@ -969,44 +969,50 @@ class EC2Instance(AWSResource):
                 await asyncio.sleep(0.1)
                 print("Interactive shell started. Type 'exit' to close the session.")
 
-                # Put terminal into cbreak/no-echo and forward keystrokes
+                # Put terminal into cbreak/no-echo and forward keystrokes using add_reader (non-blocking)
                 restore_attrs = None
                 stdin_fd = None
+                reader_installed = False
                 try:
                     import termios
                     import tty
+                    import os as _os
+                    loop_inner = asyncio.get_running_loop()
                     if sys.stdin.isatty():
                         stdin_fd = sys.stdin.fileno()
                         restore_attrs = termios.tcgetattr(stdin_fd)
                         tty.setcbreak(stdin_fd)  # no-echo, immediate key delivery
+
+                        def _on_stdin_ready() -> None:
+                            try:
+                                data = _os.read(stdin_fd, 1024)
+                                if data:
+                                    # schedule async send
+                                    asyncio.create_task(data_channel.send_input_data(data))
+                            except BlockingIOError:
+                                pass
+                            except Exception:
+                                # Best-effort; ignore stdin read errors
+                                pass
+
+                        # Install non-blocking reader; loop.add_reader exists on POSIX
+                        if hasattr(loop_inner, "add_reader") and stdin_fd is not None:
+                            loop_inner.add_reader(stdin_fd, _on_stdin_ready)
+                            reader_installed = True
                 except Exception:
                     restore_attrs = None
                     stdin_fd = None
-
-                async def _stdin_pump() -> None:
-                    try:
-                        loop_inner = asyncio.get_running_loop()
-                        while not closed_async.is_set():
-                            # Read 1 byte at a time to preserve interactive feel
-                            data = await loop_inner.run_in_executor(None, sys.stdin.buffer.read, 1)
-                            if not data:
-                                await asyncio.sleep(0.01)
-                                continue
-                            try:
-                                await data_channel.send_input_data(data)
-                            except Exception:
-                                break
-                    except Exception:
-                        pass
-
-                pump_task = asyncio.create_task(_stdin_pump())
+                    reader_installed = False
 
                 try:
                     await closed_async.wait()
                 finally:
-                    # Stop pump and restore terminal
+                    # Remove reader and restore terminal
                     try:
-                        pump_task.cancel()
+                        if reader_installed and stdin_fd is not None:
+                            loop = asyncio.get_running_loop()
+                            if hasattr(loop, "remove_reader"):
+                                loop.remove_reader(stdin_fd)
                     except Exception:
                         pass
                     try:
