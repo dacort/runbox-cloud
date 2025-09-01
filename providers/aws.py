@@ -707,6 +707,146 @@ class EC2Instance(AWSResource):
         except:
             return False
 
+    def run(self, command: str, timeout_seconds: int = 300) -> int:
+        """Run a shell command on the instance via SSM using the local plugin.
+
+        Streams output to stdout and returns when the session ends.
+        Returns the exit code reported by the session (best-effort; 0 on success
+        if not determinable).
+        """
+        import asyncio
+        import os
+        import sys
+        from threading import Event
+
+        if not self._config.get("instance_id"):
+            raise ValueError("Instance is not created; call get_or_create() first")
+
+        instance_id = self._config["instance_id"]
+
+        # Ensure the instance is registered with SSM before starting a session
+        self._wait_for_ssm_agent(instance_id, timeout_seconds)
+
+        # Add the plugin src to sys.path to allow local import
+        plugin_src = os.path.expanduser("~/src/python-session-manager-plugin/src")
+        if plugin_src not in sys.path:
+            sys.path.append(plugin_src)
+
+        try:
+            import boto3  # re-import local for mypy friendliness
+            from session_manager_plugin.cli.types import ConnectArguments
+            from session_manager_plugin.communicator.utils import create_websocket_config
+            from session_manager_plugin.communicator.data_channel import (
+                SessionDataChannel,
+            )
+            from session_manager_plugin.session.session_handler import SessionHandler
+            from session_manager_plugin.session.plugins import StandardStreamPlugin
+            from session_manager_plugin.session.registry import get_session_registry
+        except Exception as e:
+            raise RuntimeError(
+                "Session Manager Plugin not found. Please ensure it is available at "
+                "~/src/python-session-manager-plugin/ and installable as a module."
+            ) from e
+
+        # Start an SSM session to obtain StreamUrl/TokenValue
+        ssm = boto3.client("ssm")
+        start = ssm.start_session(Target=instance_id)
+
+        # Wire up a programmatic session using the plugin primitives
+        args = ConnectArguments(
+            session_id=start["SessionId"],
+            stream_url=start["StreamUrl"],
+            token_value=start["TokenValue"],
+            target=instance_id,
+            session_type="Standard_Stream",
+        )
+
+        # Register the Standard_Stream plugin (avoid duplicate warnings)
+        registry = get_session_registry()
+        try:
+            if not registry.is_session_type_supported("Standard_Stream"):
+                registry.register_plugin("Standard_Stream", StandardStreamPlugin())
+        except Exception:
+            registry.register_plugin("Standard_Stream", StandardStreamPlugin())
+
+        handler = SessionHandler()
+
+        # Execute and keep the event loop alive until the channel closes
+        async def _run_and_wait() -> int:
+            # Create session (without starting)
+            session = await handler.validate_input_and_create_session(
+                {
+                    "sessionId": args.session_id,
+                    "streamUrl": args.stream_url,
+                    "tokenValue": args.token_value,
+                    "target": args.target,
+                    "sessionType": args.session_type,
+                }
+            )
+
+            # Build data channel and handlers
+            ws_config = create_websocket_config(args.stream_url, args.token_value)
+            data_channel = SessionDataChannel(ws_config)
+
+            # Stream remote output to stdout
+            def on_remote_input(data: bytes) -> None:
+                try:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+                except Exception:
+                    pass
+
+            loop = asyncio.get_running_loop()
+            closed_async = asyncio.Event()
+
+            def on_closed() -> None:
+                try:
+                    loop.call_soon_threadsafe(closed_async.set)
+                except Exception:
+                    pass
+
+            data_channel.set_input_handler(on_remote_input)
+            data_channel.set_closed_handler(on_closed)
+
+            # Start session and wait briefly for readiness
+            session.set_data_channel(data_channel)
+            await session.execute()
+            await asyncio.sleep(0.25)
+
+            # Send command then exit
+            await data_channel.send_input_data((command + "\n").encode("utf-8"))
+            await asyncio.sleep(0.05)
+            await data_channel.send_input_data(b"exit\n")
+
+            # Wait for session close or timeout
+            try:
+                await asyncio.wait_for(closed_async.wait(), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                try:
+                    if data_channel.is_open:
+                        await data_channel.close()
+                except Exception:
+                    pass
+            return 0
+
+        return asyncio.run(_run_and_wait())
+
+    def _wait_for_ssm_agent(self, instance_id: str, timeout: int = 300) -> None:
+        """Wait until the SSM agent reports the instance as available."""
+        ssm = boto3.client("ssm")
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                resp = ssm.describe_instance_information(
+                    Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+                )
+                if resp.get("InstanceInformationList"):
+                    return
+            except Exception:
+                pass
+            time.sleep(5)
+        raise TimeoutError("SSM agent not ready within timeout")
+
 
 @depends_on(VPC)
 class S3Bucket(AWSResource):
