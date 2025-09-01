@@ -854,7 +854,6 @@ class EC2Instance(AWSResource):
     def _run_interactive(self, command: str, timeout_seconds: int = 300) -> int:
         """Run a shell command using the session manager plugin for real-time I/O."""
         import asyncio
-        import os
         import sys
 
         if not self._config.get("instance_id"):
@@ -864,11 +863,6 @@ class EC2Instance(AWSResource):
 
         # Ensure the instance is registered with SSM before starting a session
         self._wait_for_ssm_agent(instance_id, timeout_seconds)
-
-        # Add the plugin src to sys.path to allow local import
-        plugin_src = os.path.expanduser("~/src/python-session-manager-plugin/src")
-        if plugin_src not in sys.path:
-            sys.path.append(plugin_src)
 
         try:
             import boto3  # re-import local for mypy friendliness
@@ -882,8 +876,8 @@ class EC2Instance(AWSResource):
             from session_manager_plugin.session.registry import get_session_registry
         except Exception as e:
             raise RuntimeError(
-                "Session Manager Plugin not found. Please ensure it is available at "
-                "~/src/python-session-manager-plugin/ and installable as a module."
+                "Session Manager Plugin import failed. Ensure the dependency is installed: "
+                "`uv sync` with pyproject declaring python-session-manager-plugin, or install the package."
             ) from e
 
         # Start an SSM session to obtain StreamUrl/TokenValue
