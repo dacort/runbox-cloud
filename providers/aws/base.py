@@ -3,7 +3,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, TypeVar
 
 from providers import Provider
-from .state import ResourceState, StateManager, get_environment
+
+from .state import ResourceState, StateManager
 
 # Type hints
 T = TypeVar("T", bound="Resource")
@@ -155,6 +156,7 @@ class AWS(Provider):
 
     def run(self, executable, instance_type, options=None):
         import click
+
         click.echo(f"Running {executable} on AWS with instance type {instance_type}")
 
 

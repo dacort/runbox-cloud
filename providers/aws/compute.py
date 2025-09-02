@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import re
-import sys
 import time
 from typing import Optional, Union
 
 import boto3
 from botocore.exceptions import ClientError
+from session_manager_plugin.cli.main import SessionManagerPlugin
+from session_manager_plugin.cli.types import ConnectArguments
 
 from .base import AWSResource
 from .decorators import depends_on
@@ -162,23 +163,23 @@ class EC2Instance(AWSResource):
 
     def run_command(self, command: str, timeout_seconds: int = 300) -> dict:
         """Run a shell command on the instance via AWS-RunShellScript.
-        
+
         Returns a dictionary with:
         - status: 'Success', 'Failed', 'Cancelled', 'TimedOut'
         - stdout: command output (up to 24KB)
-        - stderr: command errors (up to 8KB)  
+        - stderr: command errors (up to 8KB)
         - exit_code: command exit code
         """
         if not self._config.get("instance_id"):
             raise ValueError("Instance is not created; call get_or_create() first")
 
         instance_id = self._config["instance_id"]
-        
+
         # Ensure the instance is registered with SSM before running command
         self._wait_for_ssm_agent(instance_id, timeout_seconds)
-        
+
         ssm = boto3.client("ssm")
-        
+
         # Execute via SSM RunShellScript document
         response = ssm.send_command(
             InstanceIds=[instance_id],
@@ -186,25 +187,26 @@ class EC2Instance(AWSResource):
             Parameters={"commands": [command]},
             TimeoutSeconds=timeout_seconds,
         )
-        
+
         command_id = response["Command"]["CommandId"]
-        
+
         # Wait for completion and get output
         return self._wait_for_command_completion(instance_id, command_id)
 
     def _wait_for_command_completion(self, instance_id: str, command_id: str) -> dict:
         """Wait for SSM command to complete and return results."""
         import time
+
         ssm = boto3.client("ssm")
-        
+
         while True:
             try:
                 response = ssm.get_command_invocation(
                     CommandId=command_id, InstanceId=instance_id
                 )
-                
+
                 status = response["Status"]
-                
+
                 if status in ["Success", "Failed", "Cancelled", "TimedOut"]:
                     return {
                         "status": status,
@@ -212,9 +214,9 @@ class EC2Instance(AWSResource):
                         "stderr": response.get("StandardErrorContent", ""),
                         "exit_code": response.get("ResponseCode", -1),
                     }
-                
+
                 time.sleep(2)
-                
+
             except ClientError as e:
                 if e.response["Error"]["Code"] == "InvocationDoesNotExist":
                     time.sleep(2)
@@ -224,37 +226,37 @@ class EC2Instance(AWSResource):
     def _should_use_interactive_mode(self, command: str) -> bool:
         """Determine if command should use interactive mode based on characteristics."""
         command_lower = command.lower().strip()
-        
+
         # Shell invocations - these should always be interactive
         shell_commands = [
-            'shell',      # Generic shell request
-            'bash',       # Bash shell
-            '/bin/bash',  # Full path bash
-            'zsh',        # Zsh shell
-            '/bin/zsh',   # Full path zsh
-            'sh',         # Generic shell
-            '/bin/sh',    # Full path sh
-            'fish',       # Fish shell
-            '/usr/bin/fish', # Full path fish
+            "shell",  # Generic shell request
+            "bash",  # Bash shell
+            "/bin/bash",  # Full path bash
+            "zsh",  # Zsh shell
+            "/bin/zsh",  # Full path zsh
+            "sh",  # Generic shell
+            "/bin/sh",  # Full path sh
+            "fish",  # Fish shell
+            "/usr/bin/fish",  # Full path fish
         ]
-        
+
         # Check if the command is exactly a shell command or starts with one
         for shell in shell_commands:
-            if command_lower == shell or command_lower.startswith(shell + ' '):
+            if command_lower == shell or command_lower.startswith(shell + " "):
                 return True
-        
+
         # Also check for some other interactive commands that benefit from real-time I/O
         interactive_patterns = [
-            'tail -f',    # Log following
-            'watch',      # Periodic updates  
-            'top',        # Interactive monitoring
-            'htop',       # Interactive monitoring
+            "tail -f",  # Log following
+            "watch",  # Periodic updates
+            "top",  # Interactive monitoring
+            "htop",  # Interactive monitoring
         ]
-        
+
         for pattern in interactive_patterns:
             if pattern in command_lower:
                 return True
-            
+
         return False
 
     def run(self, command: str, timeout_seconds: int = 300, mode: str = "auto") -> int:
@@ -264,7 +266,7 @@ class EC2Instance(AWSResource):
             command: Shell command to execute
             timeout_seconds: Maximum execution time
             mode: Execution mode - 'auto', 'interactive', 'batch'
-                - 'auto': Choose based on command characteristics  
+                - 'auto': Choose based on command characteristics
                 - 'interactive': Use session manager plugin for real-time I/O
                 - 'batch': Use AWS-RunShellScript for simple execution
 
@@ -279,8 +281,10 @@ class EC2Instance(AWSResource):
         elif mode == "batch":
             use_interactive = False
         else:
-            raise ValueError(f"Invalid mode '{mode}'. Use 'auto', 'interactive', or 'batch'")
-        
+            raise ValueError(
+                f"Invalid mode '{mode}'. Use 'auto', 'interactive', or 'batch'"
+            )
+
         if use_interactive:
             # Handle special case of generic "shell" command
             if command.lower().strip() == "shell":
@@ -292,14 +296,15 @@ class EC2Instance(AWSResource):
         else:
             print(f"Running command in batch mode: {command}")
             result = self.run_command(command, timeout_seconds)
-            
+
             # Print output for batch mode
             if result["stdout"]:
                 print(result["stdout"], end="")
             if result["stderr"]:
                 import sys
+
                 print(result["stderr"], file=sys.stderr, end="")
-            
+
             # Return exit code (convert to int if needed)
             exit_code = result["exit_code"]
             return int(exit_code) if exit_code != -1 else 1
@@ -309,8 +314,6 @@ class EC2Instance(AWSResource):
 
         Requires plugin support for initial_input in ConnectArguments.
         """
-        import asyncio
-
         if not self._config.get("instance_id"):
             raise ValueError("Instance is not created; call get_or_create() first")
 
@@ -319,19 +322,7 @@ class EC2Instance(AWSResource):
         # Ensure the instance is registered with SSM before starting a session
         self._wait_for_ssm_agent(instance_id, timeout_seconds)
 
-        try:
-            from session_manager_plugin.cli.main import SessionManagerPlugin
-            from session_manager_plugin.cli.types import ConnectArguments
-        except Exception as e:
-            raise RuntimeError(
-                "Session Manager Plugin import failed. Ensure the dependency is installed."
-            ) from e
-
         # Start an SSM session to obtain StreamUrl/TokenValue
-        ssm = boto3.client("ssm")
-        start = ssm.start_session(Target=instance_id)
-
-        # Start SSM session and delegate to plugin
         ssm = boto3.client("ssm")
         start = ssm.start_session(Target=instance_id)
 

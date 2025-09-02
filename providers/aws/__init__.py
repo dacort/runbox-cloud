@@ -4,26 +4,26 @@
 # Main AWS provider class
 from .base import AWS, AWSResource, Resource
 
-# State management
-from .state import ResourceState, StateManager, get_environment, set_environment
-
-# Decorators
-from .decorators import depends_on
-
-# Network resources
-from .network import VPC
-
-# IAM resources
-from .iam import EC2IAMrole, EC2InstanceProfile
+# CLI
+from .cli import main
 
 # Compute resources  
 from .compute import AWSEC2InstanceType, EC2Instance
 
+# Decorators
+from .decorators import depends_on
+
+# IAM resources
+from .iam import EC2IAMrole, EC2InstanceProfile
+
+# Network resources
+from .network import VPC
+
+# State management
+from .state import ResourceState, StateManager, get_environment, set_environment
+
 # Storage resources
 from .storage import S3Bucket
-
-# CLI
-from .cli import main
 
 # Expose commonly used classes for backward compatibility
 __all__ = [
