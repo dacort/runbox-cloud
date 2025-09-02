@@ -84,7 +84,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.38.8" },
     { name = "boto3-stubs", specifier = ">=1.39.4" },
     { name = "click", specifier = ">=8.1.8" },
-    { name = "python-session-manager-plugin", directory = "../python-session-manager-plugin" },
+    { name = "python-session-manager-plugin", editable = "../python-session-manager-plugin" },
     { name = "pyyaml", specifier = ">=6.0.2" },
 ]
 
@@ -121,7 +121,7 @@ wheels = [
 [[package]]
 name = "python-session-manager-plugin"
 version = "0.1.0"
-source = { directory = "../python-session-manager-plugin" }
+source = { editable = "../python-session-manager-plugin" }
 dependencies = [
     { name = "boto3" },
     { name = "click" },

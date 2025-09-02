@@ -305,9 +305,11 @@ class EC2Instance(AWSResource):
             return int(exit_code) if exit_code != -1 else 1
 
     def _run_interactive(self, command: str, timeout_seconds: int = 300) -> int:
-        """Run a shell command using the session manager plugin for real-time I/O."""
+        """Run an interactive session using the plugin's high-level runner.
+
+        Requires plugin support for initial_input in ConnectArguments.
+        """
         import asyncio
-        import sys
 
         if not self._config.get("instance_id"):
             raise ValueError("Instance is not created; call get_or_create() first")
@@ -318,216 +320,39 @@ class EC2Instance(AWSResource):
         self._wait_for_ssm_agent(instance_id, timeout_seconds)
 
         try:
-            import boto3  # re-import local for mypy friendliness
+            from session_manager_plugin.cli.main import SessionManagerPlugin
             from session_manager_plugin.cli.types import ConnectArguments
-            from session_manager_plugin.communicator.utils import create_websocket_config
-            from session_manager_plugin.communicator.data_channel import (
-                SessionDataChannel,
-            )
-            from session_manager_plugin.session.session_handler import SessionHandler
-            from session_manager_plugin.session.plugins import StandardStreamPlugin
-            from session_manager_plugin.session.registry import get_session_registry
         except Exception as e:
             raise RuntimeError(
-                "Session Manager Plugin import failed. Ensure the dependency is installed: "
-                "`uv sync` with pyproject declaring python-session-manager-plugin, or install the package."
+                "Session Manager Plugin import failed. Ensure the dependency is installed."
             ) from e
 
         # Start an SSM session to obtain StreamUrl/TokenValue
         ssm = boto3.client("ssm")
         start = ssm.start_session(Target=instance_id)
 
-        # Wire up a programmatic session using the plugin primitives
+        # Start SSM session and delegate to plugin
+        ssm = boto3.client("ssm")
+        start = ssm.start_session(Target=instance_id)
+
+        # Default to bash for generic 'shell'
+        if command.lower().strip() == "shell":
+            command = "bash"
+            print("Starting interactive shell session...")
+        else:
+            print(f"Running command interactively: {command}")
+
         args = ConnectArguments(
             session_id=start["SessionId"],
             stream_url=start["StreamUrl"],
             token_value=start["TokenValue"],
             target=instance_id,
             session_type="Standard_Stream",
+            initial_input=f"exec {command}",
         )
 
-        # Register the Standard_Stream plugin (avoid duplicate warnings)
-        registry = get_session_registry()
-        try:
-            if not registry.is_session_type_supported("Standard_Stream"):
-                registry.register_plugin("Standard_Stream", StandardStreamPlugin())
-        except Exception:
-            registry.register_plugin("Standard_Stream", StandardStreamPlugin())
-
-        handler = SessionHandler()
-
-        # Enhanced command execution with better exit code detection
-        async def _run_and_wait() -> int:
-            exit_code = 0
-            
-            # Create session (without starting)
-            session = await handler.validate_input_and_create_session(
-                {
-                    "sessionId": args.session_id,
-                    "streamUrl": args.stream_url,
-                    "tokenValue": args.token_value,
-                    "target": args.target,
-                    "sessionType": args.session_type,
-                }
-            )
-
-            # Build data channel and handlers
-            ws_config = create_websocket_config(args.stream_url, args.token_value)
-            data_channel = SessionDataChannel(ws_config)
-
-            # Capture output to detect exit code
-            output_buffer = []
-            
-            def on_remote_input(data: bytes) -> None:
-                try:
-                    # Buffer output for exit code detection
-                    output_buffer.append(data)
-                    # Stream to stdout
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
-                except Exception:
-                    pass
-
-            loop = asyncio.get_running_loop()
-            closed_async = asyncio.Event()
-
-            def on_closed() -> None:
-                try:
-                    loop.call_soon_threadsafe(closed_async.set)
-                except Exception:
-                    pass
-
-            data_channel.set_input_handler(on_remote_input)
-            data_channel.set_closed_handler(on_closed)
-
-            # Start session and wait briefly for readiness
-            session.set_data_channel(data_channel)
-            await session.execute()
-            await asyncio.sleep(0.25)
-
-            # Check if this is a shell session vs a command
-            is_shell_session = command.strip().lower() in ['bash', 'zsh', 'sh', 'fish', '/bin/bash', '/bin/zsh', '/bin/sh', '/usr/bin/fish']
-            
-            if is_shell_session:
-                # For shell sessions, replace the parent shell with the requested one
-                # so a single 'exit' terminates the session. Do not emit exit codes.
-                shell_wrapper = f"exec {command}"
-                await data_channel.send_input_data((shell_wrapper + "\n").encode("utf-8"))
-                await asyncio.sleep(0.1)
-                print("Interactive shell started. Type 'exit' to close the session.")
-
-                # Put terminal into cbreak/no-echo and forward keystrokes using add_reader (non-blocking)
-                restore_attrs = None
-                stdin_fd = None
-                reader_installed = False
-                sigint_installed = False
-                try:
-                    import termios
-                    import tty
-                    import os as _os
-                    import signal
-                    loop_inner = asyncio.get_running_loop()
-                    if sys.stdin.isatty():
-                        stdin_fd = sys.stdin.fileno()
-                        restore_attrs = termios.tcgetattr(stdin_fd)
-                        tty.setcbreak(stdin_fd)  # no-echo, immediate key delivery
-
-                        def _on_stdin_ready() -> None:
-                            try:
-                                data = _os.read(stdin_fd, 1024)
-                                if data:
-                                    # schedule async send
-                                    asyncio.create_task(data_channel.send_input_data(data))
-                            except BlockingIOError:
-                                pass
-                            except Exception:
-                                # Best-effort; ignore stdin read errors
-                                pass
-
-                        # Install non-blocking reader; loop.add_reader exists on POSIX
-                        if hasattr(loop_inner, "add_reader") and stdin_fd is not None:
-                            loop_inner.add_reader(stdin_fd, _on_stdin_ready)
-                            reader_installed = True
-
-                        # Forward Ctrl-C (SIGINT) to remote as ETX (0x03)
-                        def _on_sigint() -> None:
-                            try:
-                                asyncio.create_task(data_channel.send_input_data(b"\x03"))
-                            except Exception:
-                                pass
-
-                        if hasattr(loop_inner, "add_signal_handler"):
-                            try:
-                                loop_inner.add_signal_handler(signal.SIGINT, _on_sigint)
-                                sigint_installed = True
-                            except NotImplementedError:
-                                sigint_installed = False
-                except Exception:
-                    restore_attrs = None
-                    stdin_fd = None
-                    reader_installed = False
-                    sigint_installed = False
-
-                try:
-                    await closed_async.wait()
-                finally:
-                    # Remove reader and restore terminal
-                    try:
-                        if reader_installed and stdin_fd is not None:
-                            loop = asyncio.get_running_loop()
-                            if hasattr(loop, "remove_reader"):
-                                loop.remove_reader(stdin_fd)
-                    except Exception:
-                        pass
-                    # Remove SIGINT handler
-                    try:
-                        if sigint_installed:
-                            loop = asyncio.get_running_loop()
-                            if hasattr(loop, "remove_signal_handler"):
-                                import signal
-                                loop.remove_signal_handler(signal.SIGINT)
-                    except Exception:
-                        pass
-                    try:
-                        if restore_attrs is not None and stdin_fd is not None:
-                            import termios
-                            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, restore_attrs)
-                    except Exception:
-                        pass
-                # Interactive shell: return immediately; no exit code parsing
-                return 0
-            else:
-                # For regular commands, execute with exit code capture and auto-exit
-                command_with_exit_capture = f"{command}; echo \\\"EXIT_CODE:$?\\\" >&2"
-                await data_channel.send_input_data((command_with_exit_capture + "\\n").encode("utf-8"))
-                await asyncio.sleep(0.05)
-                await data_channel.send_input_data(b"exit\\n")
-
-            # Wait for session close or timeout
-            try:
-                await asyncio.wait_for(closed_async.wait(), timeout=timeout_seconds)
-                
-                # Try to extract exit code from output
-                full_output = b''.join(output_buffer).decode('utf-8', errors='ignore')
-                if "EXIT_CODE:" in full_output:
-                    try:
-                        # Find the exit code in stderr output
-                        exit_code_line = [line for line in full_output.split('\\n') if 'EXIT_CODE:' in line][-1]
-                        exit_code = int(exit_code_line.split('EXIT_CODE:')[1].strip())
-                    except (ValueError, IndexError):
-                        pass
-                        
-            except asyncio.TimeoutError:
-                try:
-                    if data_channel.is_open:
-                        await data_channel.close()
-                except Exception:
-                    pass
-                exit_code = 124  # Timeout exit code
-                
-            return exit_code
-
-        return asyncio.run(_run_and_wait())
+        plugin = SessionManagerPlugin()
+        return asyncio.run(plugin.run_session(args))
 
     def _wait_for_ssm_agent(self, instance_id: str, timeout: int = 300) -> None:
         """Wait until the SSM agent reports the instance as available."""

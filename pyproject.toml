@@ -13,6 +13,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-# Use a local editable path during development; uv will resolve this path.
-# If publishing or installing elsewhere, this can be removed or replaced with a versioned index source.
-python-session-manager-plugin = { path = "../python-session-manager-plugin" }
+python-session-manager-plugin = { path = "../python-session-manager-plugin", editable = true }
