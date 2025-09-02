@@ -420,10 +420,12 @@ class EC2Instance(AWSResource):
                 restore_attrs = None
                 stdin_fd = None
                 reader_installed = False
+                sigint_installed = False
                 try:
                     import termios
                     import tty
                     import os as _os
+                    import signal
                     loop_inner = asyncio.get_running_loop()
                     if sys.stdin.isatty():
                         stdin_fd = sys.stdin.fileno()
@@ -446,10 +448,25 @@ class EC2Instance(AWSResource):
                         if hasattr(loop_inner, "add_reader") and stdin_fd is not None:
                             loop_inner.add_reader(stdin_fd, _on_stdin_ready)
                             reader_installed = True
+
+                        # Forward Ctrl-C (SIGINT) to remote as ETX (0x03)
+                        def _on_sigint() -> None:
+                            try:
+                                asyncio.create_task(data_channel.send_input_data(b"\x03"))
+                            except Exception:
+                                pass
+
+                        if hasattr(loop_inner, "add_signal_handler"):
+                            try:
+                                loop_inner.add_signal_handler(signal.SIGINT, _on_sigint)
+                                sigint_installed = True
+                            except NotImplementedError:
+                                sigint_installed = False
                 except Exception:
                     restore_attrs = None
                     stdin_fd = None
                     reader_installed = False
+                    sigint_installed = False
 
                 try:
                     await closed_async.wait()
@@ -460,6 +477,15 @@ class EC2Instance(AWSResource):
                             loop = asyncio.get_running_loop()
                             if hasattr(loop, "remove_reader"):
                                 loop.remove_reader(stdin_fd)
+                    except Exception:
+                        pass
+                    # Remove SIGINT handler
+                    try:
+                        if sigint_installed:
+                            loop = asyncio.get_running_loop()
+                            if hasattr(loop, "remove_signal_handler"):
+                                import signal
+                                loop.remove_signal_handler(signal.SIGINT)
                     except Exception:
                         pass
                     try:
