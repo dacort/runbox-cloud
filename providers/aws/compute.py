@@ -292,12 +292,8 @@ class EC2Instance(AWSResource):
             # Handle special case of generic "shell" command
             if command.lower().strip() == "shell":
                 command = "bash"  # Default to bash for generic shell request
-                print("Starting interactive shell session...")
-            else:
-                print(f"Running command interactively: {command}")
             return self._run_interactive(command, timeout_seconds)
         else:
-            print(f"Running command in batch mode: {command}")
             result = self.run_command(command, timeout_seconds)
 
             # Print output for batch mode
@@ -332,9 +328,6 @@ class EC2Instance(AWSResource):
         # Default to bash for generic 'shell'
         if command.lower().strip() == "shell":
             command = "bash"
-            print("Starting interactive shell session...")
-        else:
-            print(f"Running command interactively: {command}")
 
         args = ConnectArguments(
             session_id=start["SessionId"],
@@ -389,17 +382,11 @@ class EC2Instance(AWSResource):
 
         # Use the file transfer client directly for better large file handling
         client = FileTransferClient()
-        
-        def show_progress(bytes_transferred: int, total_bytes: int) -> None:
-            if total_bytes > 0:
-                percentage = (bytes_transferred / total_bytes) * 100
-                print(f"Copying {local_file.name}: {bytes_transferred}/{total_bytes} bytes ({percentage:.1f}%)")
 
-        # Create file transfer options
+        # Create file transfer options (no progress callback to avoid spam)
         options = FileTransferOptions(
             chunk_size=32 * 1024,  # 32KB chunks for good performance
             verify_checksum=True,
-            progress_callback=show_progress,
         )
 
         try:

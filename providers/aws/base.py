@@ -69,23 +69,34 @@ class Resource(ABC):
             config = self._state_manager.get_resource_config(self.resource_key)
             if config and config.get("state") != ResourceState.DELETED.value:
                 self._config = config
-                print(
-                    f"Loaded existing config for {self.__class__.__name__}: {self._config.get('resource_id', 'unknown')}"
-                )
 
     def _save_config(self):
         """Save configuration to state manager."""
         if self.retain and self._config:
             self._state_manager.set_resource_config(self.resource_key, self._config)
 
+    @property
+    def resource_id(self) -> str:
+        """Get the resource ID."""
+        return self._config.get("resource_id", "")
+
+    @property
+    def was_created(self) -> bool:
+        """True if resource was created in this session (not existing)."""
+        return getattr(self, '_was_created', False)
+
+    @property
+    def was_existing(self) -> bool:
+        """True if resource was existing (not created in this session)."""
+        return getattr(self, '_was_existing', False)
+
     def get_or_create(self) -> "Resource":
         """Get or create the resource instance."""
         # Check if we have existing config and resource exists
         if self._config and self._config.get("resource_id"):
             if self._exists():
-                print(
-                    f"Using existing {self.__class__.__name__}: {self._config['resource_id']}"
-                )
+                self._was_existing = True
+                self._was_created = False
                 return self
 
         # Ensure dependents are created first
@@ -93,7 +104,6 @@ class Resource(ABC):
             dep.get_or_create()
 
         # Create this resource
-        print(f"Creating {self.__class__.__name__}...")
         self._config = {
             "state": ResourceState.CREATING.value,
             "created_at": datetime.now().isoformat(),
@@ -105,7 +115,8 @@ class Resource(ABC):
             self._config["resource_id"] = resource_id
             self._config["state"] = ResourceState.ACTIVE.value
             self._save_config()
-            print(f"Created {self.__class__.__name__}: {resource_id}")
+            self._was_created = True
+            self._was_existing = False
         except Exception as e:
             self._config["state"] = ResourceState.ERROR.value
             self._save_config()
@@ -118,7 +129,6 @@ class Resource(ABC):
         if not self._config or not self._config.get("resource_id"):
             return
 
-        print(f"Destroying {self.__class__.__name__}: {self._config['resource_id']}")
         self._config["state"] = ResourceState.DELETING.value
         self._save_config()
 
