@@ -9,6 +9,8 @@ import boto3
 from botocore.exceptions import ClientError
 from pyssm_client.cli.main import SessionManagerPlugin
 from pyssm_client.cli.types import ConnectArguments
+from pyssm_client.file_transfer.client import FileTransferClient
+from pyssm_client.file_transfer.types import FileTransferOptions
 
 from .base import AWSResource
 from .decorators import depends_on
@@ -363,7 +365,7 @@ class EC2Instance(AWSResource):
         raise TimeoutError("SSM agent not ready within timeout")
 
     async def copy_file(self, local_path: str, remote_path: str, timeout_seconds: int = 300) -> bool:
-        """Copy a file to the instance using the session manager plugin.
+        """Copy a file to the instance using the file transfer client.
         
         Args:
             local_path: Path to local file to copy
@@ -385,22 +387,27 @@ class EC2Instance(AWSResource):
         # Ensure the instance is registered with SSM before copying
         self._wait_for_ssm_agent(instance_id, timeout_seconds)
 
-        # Use the session manager plugin to copy the file
-        plugin = SessionManagerPlugin()
+        # Use the file transfer client directly for better large file handling
+        client = FileTransferClient()
         
         def show_progress(bytes_transferred: int, total_bytes: int) -> None:
             if total_bytes > 0:
                 percentage = (bytes_transferred / total_bytes) * 100
                 print(f"Copying {local_file.name}: {bytes_transferred}/{total_bytes} bytes ({percentage:.1f}%)")
 
+        # Create file transfer options
+        options = FileTransferOptions(
+            chunk_size=32 * 1024,  # 32KB chunks for good performance
+            verify_checksum=True,
+            progress_callback=show_progress,
+        )
+
         try:
-            success = await plugin.upload_file(
+            success = await client.upload_file(
                 local_path=str(local_file),
                 remote_path=remote_path,
                 target=instance_id,
-                progress_callback=show_progress,
-                verify_checksum=True,
-                chunk_size=32 * 1024,  # 32KB
+                options=options,
             )
             return success
         except Exception as e:
