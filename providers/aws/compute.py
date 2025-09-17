@@ -2,12 +2,13 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Optional, Union
 
 import boto3
 from botocore.exceptions import ClientError
-from session_manager_plugin.cli.main import SessionManagerPlugin
-from session_manager_plugin.cli.types import ConnectArguments
+from pyssm_client.cli.main import SessionManagerPlugin
+from pyssm_client.cli.types import ConnectArguments
 
 from .base import AWSResource
 from .decorators import depends_on
@@ -360,3 +361,48 @@ class EC2Instance(AWSResource):
                 pass
             time.sleep(5)
         raise TimeoutError("SSM agent not ready within timeout")
+
+    async def copy_file(self, local_path: str, remote_path: str, timeout_seconds: int = 300) -> bool:
+        """Copy a file to the instance using the session manager plugin.
+        
+        Args:
+            local_path: Path to local file to copy
+            remote_path: Destination path on the instance
+            timeout_seconds: Maximum time to wait for copy operation
+            
+        Returns:
+            True if copy was successful, False otherwise
+        """
+        if not self._config.get("instance_id"):
+            raise ValueError("Instance is not created; call get_or_create() first")
+
+        local_file = Path(local_path)
+        if not local_file.exists():
+            raise FileNotFoundError(f"Local file not found: {local_file}")
+
+        instance_id = self._config["instance_id"]
+        
+        # Ensure the instance is registered with SSM before copying
+        self._wait_for_ssm_agent(instance_id, timeout_seconds)
+
+        # Use the session manager plugin to copy the file
+        plugin = SessionManagerPlugin()
+        
+        def show_progress(bytes_transferred: int, total_bytes: int) -> None:
+            if total_bytes > 0:
+                percentage = (bytes_transferred / total_bytes) * 100
+                print(f"Copying {local_file.name}: {bytes_transferred}/{total_bytes} bytes ({percentage:.1f}%)")
+
+        try:
+            success = await plugin.upload_file(
+                local_path=str(local_file),
+                remote_path=remote_path,
+                target=instance_id,
+                progress_callback=show_progress,
+                verify_checksum=True,
+                chunk_size=32 * 1024,  # 32KB
+            )
+            return success
+        except Exception as e:
+            print(f"Failed to copy file: {e}")
+            return False
