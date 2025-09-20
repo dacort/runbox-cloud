@@ -2,12 +2,15 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Optional, Union
 
 import boto3
 from botocore.exceptions import ClientError
-from session_manager_plugin.cli.main import SessionManagerPlugin
-from session_manager_plugin.cli.types import ConnectArguments
+from pyssm_client.cli.main import SessionManagerPlugin
+from pyssm_client.cli.types import ConnectArguments
+from pyssm_client.file_transfer.client import FileTransferClient
+from pyssm_client.file_transfer.types import FileTransferOptions
 
 from .base import AWSResource
 from .decorators import depends_on
@@ -161,6 +164,16 @@ class EC2Instance(AWSResource):
         except:
             return False
 
+    async def wait_for_ssm(self, timeout: int = 300) -> None:
+        """Wait until the instance is in 'running' state and SSM agent is ready."""
+        if not self._config.get("instance_id"):
+            raise ValueError("Instance is not created; call get_or_create() first")
+
+        instance_id = self._config["instance_id"]
+
+        # Wait for SSM agent to be ready
+        self._wait_for_ssm_agent(instance_id, timeout)
+
     def run_command(self, command: str, timeout_seconds: int = 300) -> dict:
         """Run a shell command on the instance via AWS-RunShellScript.
 
@@ -174,9 +187,6 @@ class EC2Instance(AWSResource):
             raise ValueError("Instance is not created; call get_or_create() first")
 
         instance_id = self._config["instance_id"]
-
-        # Ensure the instance is registered with SSM before running command
-        self._wait_for_ssm_agent(instance_id, timeout_seconds)
 
         ssm = boto3.client("ssm")
 
@@ -289,12 +299,8 @@ class EC2Instance(AWSResource):
             # Handle special case of generic "shell" command
             if command.lower().strip() == "shell":
                 command = "bash"  # Default to bash for generic shell request
-                print("Starting interactive shell session...")
-            else:
-                print(f"Running command interactively: {command}")
             return self._run_interactive(command, timeout_seconds)
         else:
-            print(f"Running command in batch mode: {command}")
             result = self.run_command(command, timeout_seconds)
 
             # Print output for batch mode
@@ -319,9 +325,6 @@ class EC2Instance(AWSResource):
 
         instance_id = self._config["instance_id"]
 
-        # Ensure the instance is registered with SSM before starting a session
-        self._wait_for_ssm_agent(instance_id, timeout_seconds)
-
         # Start an SSM session to obtain StreamUrl/TokenValue
         ssm = boto3.client("ssm")
         start = ssm.start_session(Target=instance_id)
@@ -329,9 +332,6 @@ class EC2Instance(AWSResource):
         # Default to bash for generic 'shell'
         if command.lower().strip() == "shell":
             command = "bash"
-            print("Starting interactive shell session...")
-        else:
-            print(f"Running command interactively: {command}")
 
         args = ConnectArguments(
             session_id=start["SessionId"],
@@ -360,3 +360,44 @@ class EC2Instance(AWSResource):
                 pass
             time.sleep(5)
         raise TimeoutError("SSM agent not ready within timeout")
+
+    async def copy_file(self, local_path: str, remote_path: str, timeout_seconds: int = 300) -> bool:
+        """Copy a file to the instance using the file transfer client.
+        
+        Args:
+            local_path: Path to local file to copy
+            remote_path: Destination path on the instance
+            timeout_seconds: Maximum time to wait for copy operation
+            
+        Returns:
+            True if copy was successful, False otherwise
+        """
+        if not self._config.get("instance_id"):
+            raise ValueError("Instance is not created; call get_or_create() first")
+
+        local_file = Path(local_path)
+        if not local_file.exists():
+            raise FileNotFoundError(f"Local file not found: {local_file}")
+
+        instance_id = self._config["instance_id"]
+
+        # Use the file transfer client directly for better large file handling
+        client = FileTransferClient()
+
+        # Create file transfer options (no progress callback to avoid spam)
+        options = FileTransferOptions(
+            chunk_size=32 * 1024,  # 32KB chunks for good performance
+            verify_checksum=True,
+        )
+
+        try:
+            success = await client.upload_file(
+                local_path=str(local_file),
+                remote_path=remote_path,
+                target=instance_id,
+                options=options,
+            )
+            return success
+        except Exception as e:
+            print(f"Failed to copy file: {e}")
+            return False
