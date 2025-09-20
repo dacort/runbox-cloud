@@ -164,6 +164,16 @@ class EC2Instance(AWSResource):
         except:
             return False
 
+    async def wait_for_ssm(self, timeout: int = 300) -> None:
+        """Wait until the instance is in 'running' state and SSM agent is ready."""
+        if not self._config.get("instance_id"):
+            raise ValueError("Instance is not created; call get_or_create() first")
+
+        instance_id = self._config["instance_id"]
+
+        # Wait for SSM agent to be ready
+        self._wait_for_ssm_agent(instance_id, timeout)
+
     def run_command(self, command: str, timeout_seconds: int = 300) -> dict:
         """Run a shell command on the instance via AWS-RunShellScript.
 
@@ -177,9 +187,6 @@ class EC2Instance(AWSResource):
             raise ValueError("Instance is not created; call get_or_create() first")
 
         instance_id = self._config["instance_id"]
-
-        # Ensure the instance is registered with SSM before running command
-        self._wait_for_ssm_agent(instance_id, timeout_seconds)
 
         ssm = boto3.client("ssm")
 
@@ -318,9 +325,6 @@ class EC2Instance(AWSResource):
 
         instance_id = self._config["instance_id"]
 
-        # Ensure the instance is registered with SSM before starting a session
-        self._wait_for_ssm_agent(instance_id, timeout_seconds)
-
         # Start an SSM session to obtain StreamUrl/TokenValue
         ssm = boto3.client("ssm")
         start = ssm.start_session(Target=instance_id)
@@ -376,9 +380,6 @@ class EC2Instance(AWSResource):
             raise FileNotFoundError(f"Local file not found: {local_file}")
 
         instance_id = self._config["instance_id"]
-        
-        # Ensure the instance is registered with SSM before copying
-        self._wait_for_ssm_agent(instance_id, timeout_seconds)
 
         # Use the file transfer client directly for better large file handling
         client = FileTransferClient()

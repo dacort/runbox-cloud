@@ -54,6 +54,12 @@ def run(instance_type, provider_name, executable, silent):
             elif ec2.was_created:
                 click.echo(f"Created EC2Instance: {ec2.resource_id}")
 
+
+        # Wait for instance to be ready
+        if not silent:
+            click.echo("Waiting for SSM...")
+        await ec2.wait_for_ssm()
+
         try:
             if not silent:
                 click.echo(f"Copying {executable_name} to instance...")
