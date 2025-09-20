@@ -10,6 +10,7 @@ dependencies = [
     "click>=8.1.8",
     "pyyaml>=6.0.2",
     "pyssm-client>=0.1.0",
+    "rich>=14.1.0",
 ]
 
 [tool.uv.sources]
