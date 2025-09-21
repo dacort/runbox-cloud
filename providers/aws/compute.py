@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import re
 import time
@@ -269,7 +268,7 @@ class EC2Instance(AWSResource):
 
         return False
 
-    def run(self, command: str, timeout_seconds: int = 300, mode: str = "auto") -> int:
+    async def run(self, command: str, timeout_seconds: int = 300, mode: str = "auto") -> int:
         """Run a shell command on the instance with intelligent mode selection.
 
         Args:
@@ -299,7 +298,7 @@ class EC2Instance(AWSResource):
             # Handle special case of generic "shell" command
             if command.lower().strip() == "shell":
                 command = "bash"  # Default to bash for generic shell request
-            return self._run_interactive(command, timeout_seconds)
+            return await self.run_interactive(command, timeout_seconds)
         else:
             result = self.run_command(command, timeout_seconds)
 
@@ -315,7 +314,7 @@ class EC2Instance(AWSResource):
             exit_code = result["exit_code"]
             return int(exit_code) if exit_code != -1 else 1
 
-    def _run_interactive(self, command: str, timeout_seconds: int = 300) -> int:
+    async def run_interactive(self, command: str, timeout_seconds: int = 300) -> int:
         """Run an interactive session using the plugin's high-level runner.
 
         Requires plugin support for initial_input in ConnectArguments.
@@ -343,7 +342,7 @@ class EC2Instance(AWSResource):
         )
 
         plugin = SessionManagerPlugin()
-        return asyncio.run(plugin.run_session(args))
+        return await plugin.run_session(args)
 
     def _wait_for_ssm_agent(self, instance_id: str, timeout: int = 300) -> None:
         """Wait until the SSM agent reports the instance as available."""
