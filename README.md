@@ -1,5 +1,17 @@
 # Cloud Run
 
+Run executables on cloud instances with a single command. Automatically provisions infrastructure, executes your code, and cleans up.
+
+## Quick Start
+
+```bash
+# Run on AWS EC2
+python main.py run --instance-type m5.large ./my_benchmark
+
+# Run on DigitalOcean Droplet
+python main.py run --provider digitalocean --instance-type s-2vcpu-4gb ./my_benchmark
+```
+
 ## TODOS
 
 - Allow user to specify a pre-existing VPC or IAM Role
