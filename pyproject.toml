@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "cloud-run"
 version = "0.1.1"
-description = "Add your description here"
+description = "Cloud execution platform - run executables on AWS and DigitalOcean instances"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,4 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-cloud-run = "main:cli"
+cloud-run = "runbox.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
