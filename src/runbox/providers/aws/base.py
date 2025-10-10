@@ -1,4 +1,4 @@
-from providers import Provider
+from runbox.providers import Provider
 from runbox.providers.base import Resource
 
 
