@@ -1,15 +1,71 @@
 # Cloud Run
 
-Run executables on cloud instances with a single command. Automatically provisions infrastructure, executes your code, and cleans up.
+Run executables on cloud instances with a single command.
 
 ## Quick Start
 
+No installation required! Use `uvx` to run directly from GitHub.
+
+If you already have your AWS credentials set up, you can try it out right away!
+
 ```bash
 # Run on AWS EC2
-python main.py run --instance-type m5.large ./my_benchmark
+uvx --from git+https://github.com/dacort/runbox-cloud cloud-run run --instance-type t3.micro <my_executable>
+```
 
-# Run on DigitalOcean Droplet
-python main.py run --provider digitalocean --instance-type s-2vcpu-4gb ./my_benchmark
+Behind the scenes, we create a VPC (if needed), all the supporting IAM roles, launch your instance, execute your code, and clean up the instance when done. The VPC and roles are left behind for faster subsequent runs.
+
+If you want, you can also just shell into the instance.
+
+```bash
+# Interactive shell on an instance
+uvx --from git+https://github.com/dacort/runbox-cloud cloud-run shell --instance-type t3.micro
+```
+
+## Need a test script?
+
+Create a simple test script:
+
+```bash
+cat > test-it.sh << 'EOF'
+#!/bin/sh
+
+echo "==================================="
+echo "      HELLO FROM RUNBOX.CLOUD"
+echo "==================================="
+echo
+
+echo $(ec2-metadata --instance-type)
+echo $(hostname)
+echo
+
+echo 👋
+EOF
+
+chmod +x test-it.sh
+```
+
+Then run it:
+
+```bash
+uvx --from git+https://github.com/dacort/runbox-cloud cloud-run run --instance-type t3.micro ./test-it.sh
+```
+
+## Commands
+
+- `run` - Execute a file on a cloud instance (auto-cleanup)
+- `shell` - Start an interactive shell session (auto-cleanup)
+
+## Supported Clouds
+
+### AWS
+Default provider. Requires AWS credentials configured (`aws configure` or environment variables).
+
+### DigitalOcean
+Specify with `--provider digitalocean`. Requires `DIGITALOCEAN_TOKEN` environment variable and `doctl` command.
+
+```bash
+uvx --from git+https://github.com/dacort/runbox-cloud cloud-run run --provider digitalocean --instance-type s-2vcpu-4gb <my_executable>
 ```
 
 ## TODOS
