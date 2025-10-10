@@ -14,5 +14,5 @@ dependencies = [
     "rich>=14.1.0",
 ]
 
-[tool.uv.sources]
-pyssm-client = { path = "../python-session-manager-plugin", editable = true }
+[project.scripts]
+cloud-run = "main:cli"
