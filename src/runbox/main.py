@@ -1,7 +1,7 @@
 import click
 
-from commands.run import run
-from commands.shell import shell
+from runbox.commands.run import run
+from runbox.commands.shell import shell
 
 
 @click.group()

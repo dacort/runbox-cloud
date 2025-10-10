@@ -1,5 +1,5 @@
 from providers import Provider
-from providers.base import Resource
+from runbox.providers.base import Resource
 
 
 class DigitalOcean(Provider):

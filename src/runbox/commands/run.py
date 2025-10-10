@@ -4,8 +4,8 @@ from pathlib import Path
 
 import click
 
-from providers.aws import VPC, EC2Instance
-from providers.digitalocean import Droplet, SSHKey
+from runbox.providers.aws import VPC, EC2Instance
+from runbox.providers.digitalocean import Droplet, SSHKey
 
 @click.command()
 @click.option("--provider", type=click.Choice(["aws", "digitalocean"], case_sensitive=False), default="aws", help="Cloud provider to use (default: aws)")

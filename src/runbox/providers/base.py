@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional, TypeVar
 
-from providers.aws.state import ResourceState, StateManager
+from runbox.providers.aws.state import ResourceState, StateManager
 
 # Type hints
 T = TypeVar("T", bound="Resource")

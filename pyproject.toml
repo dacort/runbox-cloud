@@ -21,3 +21,6 @@ dependencies = [
 [project.scripts]
 cloud-run = "runbox.main:cli"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+

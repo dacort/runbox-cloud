@@ -4,7 +4,7 @@ from pathlib import Path
 
 import click
 
-from providers.aws import VPC, EC2Instance
+from runbox.providers.aws import VPC, EC2Instance
 
 @click.command()
 @click.option("--instance-type", help="Type of instance to use.", required=True)
