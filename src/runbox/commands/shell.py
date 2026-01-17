@@ -8,10 +8,11 @@ from runbox.providers.aws import VPC, EC2Instance
 
 @click.command()
 @click.option("--instance-type", help="Type of instance to use.", required=True)
+@click.option("--disk-size", type=int, default=100, help="Root volume size in GB (default: 100)")
 @click.option(
     "-s", "--silent", is_flag=True, help="Silent mode - only show instance output"
 )
-def shell(instance_type, silent):
+def shell(instance_type, disk_size, silent):
     """Run an executable on a cloud instance."""
     async def run_on_instance():
         start_time = time.time()
@@ -36,7 +37,7 @@ def shell(instance_type, silent):
 
         # Time EC2 creation
         ec2_start = time.time()
-        ec2 = EC2Instance(instance_type=instance_type, vpc=vpc, retain=False)
+        ec2 = EC2Instance(instance_type=instance_type, vpc=vpc, retain=False, root_volume_size=disk_size)
         ec2.get_or_create()
         ec2_time = time.time() - ec2_start
 
