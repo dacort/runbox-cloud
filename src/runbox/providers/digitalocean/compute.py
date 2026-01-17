@@ -66,6 +66,14 @@ class Droplet(DigitalOceanResource):
         self.size = size
         self.image = image
         self.region = region
+        if volume_size is not None:
+            if not isinstance(volume_size, int):
+                raise TypeError("volume_size must be an integer number of gigabytes (GB).")
+            # DigitalOcean block storage volumes must be between 1 GB and 16 TB (16384 GB).
+            if volume_size < 1 or volume_size > 16 * 1024:
+                raise ValueError(
+                    "volume_size must be between 1 GB and 16384 GB (16 TB), in whole GB increments."
+                )
         self.volume_size = volume_size
         super().__init__(sshkey=sshkey, **kwargs)
 
