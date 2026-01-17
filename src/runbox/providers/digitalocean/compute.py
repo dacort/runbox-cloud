@@ -133,6 +133,7 @@ class Droplet(DigitalOceanResource):
             volume_id = vol_response["volume"]["id"]
             self._config["volume_id"] = volume_id
             self._config["volume_name"] = volume_name
+            self._save_config()
             logger.info(f"Created volume {volume_name} ({self.volume_size}GB)")
 
         return droplet_id
