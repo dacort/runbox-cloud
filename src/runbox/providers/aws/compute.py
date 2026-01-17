@@ -77,7 +77,7 @@ class EC2Instance(AWSResource):
         """Get the root device name from the AMI."""
         # Handle SSM parameter resolution - need to resolve the actual AMI ID first
         if ami_id.startswith("resolve:ssm:"):
-            ssm = boto3.client("ssm")
+            ssm = boto3.client("ssm", region_name=ec2_client.meta.region_name)
             param_name = ami_id.replace("resolve:ssm:", "")
             response = ssm.get_parameter(Name=param_name)
             ami_id = response["Parameter"]["Value"]
