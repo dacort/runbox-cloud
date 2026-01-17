@@ -53,12 +53,14 @@ class EC2Instance(AWSResource):
         ami_id: Optional[str] = None,
         vpc: Optional[VPC] = None,
         ec2instanceprofile: Optional[EC2InstanceProfile] = None,
+        root_volume_size: int = 100,
         **kwargs,
     ):
         if isinstance(instance_type, str):
             instance_type = AWSEC2InstanceType(instance_type)
         self.instance_type = instance_type
         self.ami_id = ami_id or self._get_default_ami()
+        self.root_volume_size = root_volume_size
         super().__init__(vpc=vpc, ec2instanceprofile=ec2instanceprofile, **kwargs)
 
     def _get_default_ami(self) -> str:
@@ -71,6 +73,21 @@ class EC2Instance(AWSResource):
 
         return f"resolve:ssm:/aws/service/ami-amazon-linux-latest/{ssm_parameter}"
 
+    def _get_root_device_name(self, ec2_client, ami_id: str) -> str:
+        """Get the root device name from the AMI."""
+        # Handle SSM parameter resolution - need to resolve the actual AMI ID first
+        if ami_id.startswith("resolve:ssm:"):
+            ssm = boto3.client("ssm")
+            param_name = ami_id.replace("resolve:ssm:", "")
+            response = ssm.get_parameter(Name=param_name)
+            ami_id = response["Parameter"]["Value"]
+
+        response = ec2_client.describe_images(ImageIds=[ami_id])
+        if not response["Images"]:
+            # Fallback to common default
+            return "/dev/xvda"
+        return response["Images"][0].get("RootDeviceName", "/dev/xvda")
+
     def _create(self) -> str:
         ec2 = boto3.client("ec2")
 
@@ -78,6 +95,9 @@ class EC2Instance(AWSResource):
         vpc_config = self.vpc._config
         if not vpc_config.get("security_group_id"):
             raise ValueError("VPC configuration is not available")
+
+        # Get the correct root device name for this AMI
+        root_device_name = self._get_root_device_name(ec2, self.ami_id)
 
         # Build up the instance config
         run_instance_kwargs = {
@@ -91,6 +111,16 @@ class EC2Instance(AWSResource):
             if self.ec2instanceprofile
             else None,
             "UserData": self.instance_type.al2023_ssm(),
+            "BlockDeviceMappings": [
+                {
+                    "DeviceName": root_device_name,
+                    "Ebs": {
+                        "VolumeSize": self.root_volume_size,
+                        "VolumeType": "gp3",
+                        "DeleteOnTermination": True,
+                    },
+                }
+            ],
         }
 
         if self.use_public_ip:

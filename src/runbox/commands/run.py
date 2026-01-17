@@ -10,11 +10,12 @@ from runbox.providers.digitalocean import Droplet, SSHKey
 @click.command()
 @click.option("--provider", type=click.Choice(["aws", "digitalocean"], case_sensitive=False), default="aws", help="Cloud provider to use (default: aws)")
 @click.option("--instance-type", help="Type of instance to use (AWS: instance type, DO: size slug).", required=True)
+@click.option("--disk-size", type=int, default=100, help="Root volume size in GB (default: 100). For AWS, this is the root EBS volume. For DO, this creates a block storage volume at /mnt/data.")
 @click.option(
     "-s", "--silent", is_flag=True, help="Silent mode - only show instance output"
 )
 @click.argument("executable", type=click.Path(exists=True))
-def run(provider, instance_type, executable, silent):
+def run(provider, instance_type, disk_size, executable, silent):
     """Run an executable on a cloud instance."""
     executable_path = Path(executable)
     executable_name = executable_path.name
@@ -47,7 +48,7 @@ def run(provider, instance_type, executable, silent):
 
             # Time EC2 creation
             instance_start = time.time()
-            instance = EC2Instance(instance_type=instance_type, vpc=vpc, retain=False)
+            instance = EC2Instance(instance_type=instance_type, vpc=vpc, retain=False, root_volume_size=disk_size)
             instance.get_or_create()
             instance_time = time.time() - instance_start
 
@@ -86,7 +87,7 @@ def run(provider, instance_type, executable, silent):
 
             # Time Droplet creation
             instance_start = time.time()
-            instance = Droplet(size=instance_type, sshkey=ssh_key, retain=False)
+            instance = Droplet(size=instance_type, sshkey=ssh_key, retain=False, volume_size=disk_size)
             instance.get_or_create()
             instance_time = time.time() - instance_start
 

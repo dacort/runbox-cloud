@@ -49,6 +49,7 @@ class Droplet(DigitalOceanResource):
         image: str = "ubuntu-24-04-x64",
         region: str = "nyc3",
         sshkey: Optional[SSHKey] = None,
+        volume_size: Optional[int] = None,
         **kwargs,
     ):
         """Initialize Droplet resource.
@@ -58,10 +59,14 @@ class Droplet(DigitalOceanResource):
             image: Image slug or ID (default: ubuntu-24-04-x64)
             region: Region slug (default: nyc3)
             sshkey: SSHKey resource instance
+            volume_size: Optional block storage volume size in GB to attach.
+                        Note: DO root disk is fixed to droplet size, so this
+                        creates an additional volume mounted at /mnt/data.
         """
         self.size = size
         self.image = image
         self.region = region
+        self.volume_size = volume_size
         super().__init__(sshkey=sshkey, **kwargs)
 
     def _get_client(self) -> Client:
@@ -95,24 +100,49 @@ class Droplet(DigitalOceanResource):
         response = client.droplets.create(body=req)
         droplet = response["droplet"]
         droplet_id = str(droplet["id"])
+        droplet_name = droplet["name"]
 
         # Update config
         self._config.update({
             "droplet_id": droplet_id,
-            "droplet_name": droplet["name"],
+            "droplet_name": droplet_name,
             "size": self.size,
             "image": self.image,
             "region": self.region,
         })
 
+        # Create and attach block storage volume if requested
+        if self.volume_size:
+            volume_name = f"{droplet_name}-data"
+            volume_req = {
+                "size_gigabytes": self.volume_size,
+                "name": volume_name,
+                "region": self.region,
+                "filesystem_type": "ext4",
+                "filesystem_label": "data",
+            }
+            vol_response = client.volumes.create(body=volume_req)
+            volume_id = vol_response["volume"]["id"]
+            self._config["volume_id"] = volume_id
+            self._config["volume_name"] = volume_name
+            logger.info(f"Created volume {volume_name} ({self.volume_size}GB)")
+
         return droplet_id
 
     def _destroy(self):
-        """Destroy the Droplet."""
+        """Destroy the Droplet and any attached volumes."""
+        client = self._get_client()
+
+        # Destroy volume first if it exists
+        if self._config.get("volume_id"):
+            try:
+                client.volumes.delete(volume_id=self._config["volume_id"])
+                logger.info(f"Destroyed volume {self._config.get('volume_name')}")
+            except Exception as e:
+                logger.warning(f"Failed to destroy volume: {e}")
+
         if not self._config.get("droplet_id"):
             return
-
-        client = self._get_client()
 
         try:
             client.droplets.destroy(droplet_id=self._config["droplet_id"])
@@ -167,6 +197,45 @@ class Droplet(DigitalOceanResource):
 
         # Now wait for SSH to be ready
         await self._wait_for_ssh(timeout - int(time.time() - start_time))
+
+        # Attach and mount volume if one was created
+        if self._config.get("volume_id"):
+            await self._attach_and_mount_volume()
+
+    async def _attach_and_mount_volume(self) -> None:
+        """Attach the block storage volume and mount it at /mnt/data."""
+        volume_id = self._config.get("volume_id")
+        droplet_id = self._config.get("droplet_id")
+
+        if not volume_id or not droplet_id:
+            return
+
+        client = self._get_client()
+
+        # Attach volume to droplet
+        attach_req = {
+            "type": "attach",
+            "droplet_id": int(droplet_id),
+        }
+        client.volume_actions.post(volume_id=volume_id, body=attach_req)
+        logger.info(f"Attached volume {self._config.get('volume_name')} to droplet")
+
+        # Wait a moment for the volume to be attached
+        time.sleep(5)
+
+        # Mount the volume - DO volumes with filesystem_type are auto-formatted
+        # but need to be mounted. The device is /dev/disk/by-id/scsi-0DO_Volume_<name>
+        volume_name = self._config.get("volume_name")
+        mount_commands = [
+            "mkdir -p /mnt/data",
+            f"mount -o defaults,nofail,discard,noatime /dev/disk/by-id/scsi-0DO_Volume_{volume_name} /mnt/data",
+        ]
+        for cmd in mount_commands:
+            result = self.run_command(cmd)
+            if result["status"] != "Success":
+                logger.warning(f"Mount command failed: {result['stderr']}")
+
+        logger.info("Volume mounted at /mnt/data")
 
     async def _wait_for_ssh(self, timeout: int = 120) -> None:
         """Wait until SSH is accepting connections on the droplet.
